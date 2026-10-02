@@ -30,6 +30,16 @@ echo "--- GET /missions/shift-1 ---"
 curl -s "$BASE/missions/shift-1"; echo
 echo "--- GET /missions/shift-1/schedule ---"
 curl -s "$BASE/missions/shift-1/schedule"; echo
+echo "--- temporary closure: POST /missions/closed/plan ---"
+curl -s -X POST "$BASE/missions" -H "$JSON" -H 'Idempotency-Key: closed-request' \
+  -d '{"id":"closed","map_id":"warehouse","agents":[{"id":"agv-1","start":[0,0],"goal":[4,0]}]}' >/dev/null
+curl -s -X POST "$BASE/missions/closed/plan" -H "$JSON" -H 'Idempotency-Key: closed-plan' \
+  -d '{"closures":[{"cells":[[1,0]],"start_tick":1,"end_tick":1}]}'; echo
+echo "--- closure blocks the start at t=0: POST /missions/sealed/plan ---"
+curl -s -X POST "$BASE/missions" -H "$JSON" -H 'Idempotency-Key: sealed-request' \
+  -d '{"id":"sealed","map_id":"warehouse","agents":[{"id":"agv-1","start":[0,0],"goal":[4,0]}]}' >/dev/null
+curl -s -X POST "$BASE/missions/sealed/plan" -H "$JSON" -H 'Idempotency-Key: sealed-plan' \
+  -d '{"closures":[{"cells":[[0,0]],"start_tick":0,"end_tick":100000}]}'; echo
 echo "--- unsolvable: POST /missions/swap/plan ---"
 curl -s -X POST "$BASE/maps" -H "$JSON" -H 'Idempotency-Key: lane-map' \
   -d '{"id":"lane","width":4,"height":1,"grid":["...."]}' >/dev/null

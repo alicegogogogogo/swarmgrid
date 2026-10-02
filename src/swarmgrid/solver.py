@@ -35,10 +35,11 @@ from dataclasses import dataclass
 from itertools import permutations
 from typing import Iterable
 
-from .model import Agent, Mission, Point
+from .model import Agent, Closure, Mission, Point
 
 Move = tuple[int, int]
 Path = tuple[Point, ...]
+Closures = tuple[Closure, ...]
 ConstraintSet = dict[str, tuple[frozenset[tuple[Point, int]], frozenset[tuple[Point, int, Point]]]]
 
 DEFAULT_ORDER_BUDGET = 24
@@ -55,6 +56,75 @@ MAX_TIMESTEP = 40
 # ties in the A* heap fall back to the insertion counter, so no set/dict
 # iteration order can leak into a plan.
 DIRECTIONS: tuple[Move, ...] = ((0, 0), (1, 0), (0, 1), (-1, 0), (0, -1))
+
+
+def _closure_cell_set(closures: Closures, timestep: int) -> frozenset[Point]:
+    """Cells every agent is forbidden to occupy at `timestep` by a closure."""
+    blocked: set[Point] = set()
+    for closure in closures:
+        if closure.start_tick <= timestep <= closure.end_tick:
+            blocked.update(closure.cells)
+    return frozenset(blocked)
+
+
+def _closure_start_conflict(agent: Agent, closures: Closures) -> Conflict | None:
+    """A closure that already covers the agent's start at t=0 blocks the plan.
+
+    The first state of every time-indexed path is the start cell at tick 0, so
+    such an agent has no legal first state at all; name the closure directly.
+    """
+    covering = [
+        closure
+        for closure in closures
+        if closure.start_tick == 0 and agent.start in closure.cells_set
+    ]
+    if not covering:
+        return None
+    return Conflict(
+        "closure",
+        0,
+        agent.id,
+        None,
+        agent.start,
+        None,
+        f"agent {agent.id} is blocked on its start {list(agent.start)} at t=0 by a temporary closure",
+    )
+
+
+def _closure_block_conflict(
+    agent: Agent,
+    closures: Closures,
+    closure_prune: tuple[int, Point] | None = None,
+) -> Conflict:
+    """Name the closure that kept `agent` off its goal.
+
+    `closure_prune`, when the search actually saw one, is the earliest tick (then
+    smallest cell) a closure pruned; report that concrete block. Otherwise fall
+    back to the closure whose interval starts earliest.
+    """
+    if closure_prune is not None:
+        timestep, cell = closure_prune
+        interval = next(
+            closure
+            for closure in closures
+            if closure.start_tick <= timestep <= closure.end_tick and cell in closure.cells_set
+        )
+        end_tick = interval.end_tick
+    else:
+        interval = min(closures, key=lambda item: (item.start_tick, item.end_tick))
+        timestep = interval.start_tick
+        end_tick = interval.end_tick
+        cell = min(interval.cells)
+    return Conflict(
+        "closure",
+        timestep,
+        agent.id,
+        None,
+        cell,
+        None,
+        f"agent {agent.id} cannot reach goal {list(agent.goal)}: a temporary closure blocks "
+        f"{list(cell)} from t={timestep} to t={end_tick}",
+    )
 
 
 @dataclass(frozen=True)
@@ -150,6 +220,7 @@ def space_time_astar(
     forbidden_cells: frozenset[tuple[Point, int]] = frozenset(),
     forbidden_edges: frozenset[tuple[Point, int, Point]] = frozenset(),
     hold: int = 0,
+    closures: Closures = (),
 ) -> tuple[Path | None, Conflict | None]:
     """Plan `agent` in space and time.
 
@@ -167,12 +238,17 @@ def space_time_astar(
     * `planned` -- paths of higher-priority agents;
     * `forbidden_cells` -- `(cell, timestep)` the agent may not occupy;
     * `forbidden_edges` -- `(from_cell, timestep, to_cell)` the agent may not
-      traverse; both directions of a traded edge are forbidden together.
+      traverse; both directions of a traded edge are forbidden together;
+    * `closures` -- task-level temporary closures: on the closed tick interval
+      the listed cells may not be moved into, waited on, or held at all.
 
     Returns `(path, None)` on success, or `(None, conflict)` naming the blocking
     constraint when the goal cannot be reached under them.
     """
     planned = planned or []
+    start_blocked = _closure_start_conflict(agent, closures)
+    if start_blocked is not None:
+        return None, start_blocked
     if distance_to_goal is None:
         distance_to_goal = distance_map(map_record, agent.goal)
     index_of_start = map_record.index(agent.start)
@@ -215,6 +291,10 @@ def space_time_astar(
     came_from: dict[tuple[Point, int], tuple[Point, int] | None] = {(start, 0): None}
     reached: set[tuple[Point, int]] = {(start, 0)}
     expansions = 0
+    # The earliest tick (then smallest cell) at which a closure pruned a move the
+    # search actually considered; that is the concrete obstruction to report if
+    # no route survives.
+    closure_prune: tuple[int, Point] | None = None
 
     while heap:
         _, timestep, _, cell = heapq.heappop(heap)
@@ -223,10 +303,15 @@ def space_time_astar(
         expansions += 1
         if expansions > MAX_EXPANSIONS:
             break
-        if cell == agent.goal and (cell, timestep) not in forbidden_cells:
+        if (
+            cell == agent.goal
+            and (cell, timestep) not in forbidden_cells
+            and cell not in _closure_cell_set(closures, timestep)
+        ):
             return _fill_waits(came_from, (cell, timestep), agent.goal), None
 
         following = timestep + 1
+        closed_cells = _closure_cell_set(closures, following)
         for move in DIRECTIONS:
             neighbor = (cell[0] + move[0], cell[1] + move[1])
             if not map_record.walkable(neighbor):
@@ -234,6 +319,13 @@ def space_time_astar(
             if timestep < hold and neighbor != start:
                 continue
             if (neighbor, following) in forbidden_cells:
+                continue
+            if neighbor in closed_cells:
+                # A temporary closure forbids entering, waiting on, or holding
+                # this cell on this tick.
+                candidate = (following, neighbor)
+                if closure_prune is None or candidate < closure_prune:
+                    closure_prune = candidate
                 continue
             if (cell, following, neighbor) in forbidden_edges:
                 continue
@@ -249,7 +341,7 @@ def space_time_astar(
                 (distance_to_goal[map_record.index(neighbor)] + following, following, counter, neighbor),
             )
 
-    return None, _exhausted(agent, planned, forbidden_cells, forbidden_edges)
+    return None, _exhausted(agent, planned, forbidden_cells, forbidden_edges, closures, closure_prune)
 
 
 def _exhausted(
@@ -257,6 +349,8 @@ def _exhausted(
     planned: list[tuple[str, Path]],
     forbidden_cells: frozenset[tuple[Point, int]],
     forbidden_edges: frozenset[tuple[Point, int, Point]],
+    closures: Closures = (),
+    closure_prune: tuple[int, Point] | None = None,
 ) -> Conflict:
     """Explain an exhausted search; the usual causes are checked in order."""
     for other_id, path in planned:
@@ -295,6 +389,8 @@ def _exhausted(
             f"agent {agent.id} cannot reach goal {list(agent.goal)}: the edge "
             f"{list(edge[0])}->{list(edge[1])} is forbidden at t={timestep}",
         )
+    if closures:
+        return _closure_block_conflict(agent, closures, closure_prune)
     return Conflict(
         "unreachable_goal",
         0,
@@ -407,13 +503,38 @@ def plan_mission(
     requested_priority: list[str] | None = None,
     order_budget: int = DEFAULT_ORDER_BUDGET,
     tree_budget: int = DEFAULT_TREE_BUDGET,
+    closures: Closures = (),
 ) -> PlanResult:
     """Resolve `mission` with prioritized planning, then a constraint tree.
 
     `map_record` is duck-typed: it needs `width`, `height`, `walkable`, `index`,
     and `neighbors` (that is, :class:`swarmgrid.model.Map`).
+
+    `closures` are task-level temporary closures shared by every agent: on each
+    closure's closed tick interval its cells act as space-time obstacles for the
+    whole fleet.
     """
     agents = tuple(sorted(mission.agents, key=lambda agent: agent.id))
+    orders_budget = _orders_budget(len(agents), order_budget, requested_priority)
+
+    # A closure already covering a start at tick 0 denies the agent its first
+    # state in every order and every tree node, so diagnose it directly once.
+    start_blocked = [
+        conflict
+        for agent in agents
+        if (conflict := _closure_start_conflict(agent, closures)) is not None
+    ]
+    if start_blocked:
+        return PlanResult(
+            status="unsolvable",
+            method="none",
+            order=(),
+            paths=(),
+            conflicts=tuple(start_blocked),
+            orders_tried=0,
+            orders_budget=orders_budget,
+        )
+
     distance_from_goal: dict[Point, list[int | None]] = {
         agent.goal: distance_map(map_record, agent.goal) for agent in agents
     }
@@ -438,10 +559,10 @@ def plan_mission(
             paths=(),
             conflicts=tuple(sorted(unreachable, key=lambda conflict: conflict.as_key())),
             orders_tried=0,
-            orders_budget=_orders_budget(len(agents), order_budget, requested_priority),
+            orders_budget=orders_budget,
         )
 
-    budget = _orders_budget(len(agents), order_budget, requested_priority)
+    budget = orders_budget
     if requested_priority is not None:
         sequence: list[tuple[str, ...]] = [tuple(requested_priority)]
     else:
@@ -452,7 +573,7 @@ def plan_mission(
     for order_ids in sequence:
         tried += 1
         order = tuple(next(agent for agent in agents if agent.id == agent_id) for agent_id in order_ids)
-        paths, failure = _run_order(map_record, order, distance_from_goal)
+        paths, failure = _run_order(map_record, order, distance_from_goal, closures=closures)
         if paths is None:
             if failure is not None:
                 conflicts.append(failure)
@@ -472,7 +593,9 @@ def plan_mission(
         )
 
     if requested_priority is None:
-        solution = _constraint_tree(map_record, agents, distance_from_goal, tree_budget, budget)
+        solution = _constraint_tree(
+            map_record, agents, distance_from_goal, tree_budget, budget, closures
+        )
         if solution is not None:
             paths, tree_conflicts = solution
             if not tree_conflicts:
@@ -504,6 +627,7 @@ def _run_order(
     distance_from_goal: dict[Point, list[int | None]],
     constraints: ConstraintSet | None = None,
     first_hold: int = 0,
+    closures: Closures = (),
 ) -> tuple[list[Path] | None, Conflict | None]:
     """Plan `order` one agent at a time, each treating the earlier paths as moving obstacles.
 
@@ -527,13 +651,14 @@ def _run_order(
                 cells,
                 edges,
                 first_hold,
+                closures,
             )
             if path is None:
                 assert failure is not None
                 return None, failure
         else:
             path, failure = _route_with_wait(
-                map_record, agent, planned, distance_from_goal, cells, edges
+                map_record, agent, planned, distance_from_goal, cells, edges, closures
             )
             if path is None:
                 assert failure is not None
@@ -549,6 +674,7 @@ def _route_with_wait(
     distance_from_goal: dict[Point, list[int | None]],
     cells: frozenset[tuple[Point, int]],
     edges: frozenset[tuple[Point, int, Point]],
+    closures: Closures = (),
 ) -> tuple[Path | None, Conflict | None]:
     """Try routing `agent` after holding its start cell for 0..N ticks.
 
@@ -559,13 +685,17 @@ def _route_with_wait(
     failure: Conflict | None = None
     for hold in range(DEFAULT_HOLD_BUDGET + 1):
         path, conflict = space_time_astar(
-            map_record, agent, planned, distance_from_goal[agent.goal], cells, edges, hold
+            map_record, agent, planned, distance_from_goal[agent.goal], cells, edges, hold, closures
         )
         if path is not None:
             return path, None
         if failure is None:
             failure = conflict
     assert failure is not None
+    # A closure denies a tick interval to everyone; when it is what exhausted the
+    # search, the inter-agent heuristics below would mislabel the blockage.
+    if failure.type == "closure":
+        return None, failure
     for other_id, path in planned:
         if path[-1] == agent.goal:
             return None, Conflict(
@@ -616,6 +746,7 @@ def _constraint_tree(
     distance_from_goal: dict[Point, list[int | None]],
     tree_budget: int,
     order_budget: int = DEFAULT_ORDER_BUDGET,
+    closures: Closures = (),
 ) -> tuple[list[Path], list[Conflict]] | None:
     """Best-first search over sets of per-agent space-time constraints.
 
@@ -623,9 +754,13 @@ def _constraint_tree(
     returns `(infeasible_paths, [conflict])` explaining why: the failure blocking
     the best node when the tree ran out of budget, or an empty conflict list when
     every node it reached was infeasible and nothing was left to branch on.
+
+    Temporary `closures` constrain every node alike -- they are fleet-wide
+    facts, not branching choices -- so they are passed straight to each node's
+    low-level planner.
     """
     root: ConstraintSet = {}
-    paths, failure = _plan_all(map_record, agents, distance_from_goal, root, order_budget)
+    paths, failure = _plan_all(map_record, agents, distance_from_goal, root, order_budget, closures)
     if failure is None:
         return paths, []
     counter = 0
@@ -647,7 +782,7 @@ def _constraint_tree(
         expanded += 1
         for child in _branch(constraints, failure):
             child_paths, child_failure = _plan_all(
-                map_record, agents, distance_from_goal, child, order_budget
+                map_record, agents, distance_from_goal, child, order_budget, closures
             )
             counter += 1
             heapq.heappush(
@@ -670,6 +805,7 @@ def _plan_all(
     distance_from_goal: dict[Point, list[int | None]],
     constraints: ConstraintSet,
     order_budget: int = DEFAULT_ORDER_BUDGET,
+    closures: Closures = (),
 ) -> tuple[list[Path], Conflict | None]:
     """Plan all agents at one node of the constraint tree.
 
@@ -685,7 +821,7 @@ def _plan_all(
         order = tuple(next(agent for agent in agents if agent.id == agent_id) for agent_id in order_ids)
         for first_hold in range(DEFAULT_HOLD_BUDGET + 1):
             outcome, failure = _run_order(
-                map_record, order, distance_from_goal, constraints, first_hold
+                map_record, order, distance_from_goal, constraints, first_hold, closures
             )
             if outcome is not None:
                 joint = detect_conflicts(order, outcome)
@@ -723,7 +859,10 @@ def _branch(constraints: ConstraintSet, conflict: Conflict) -> list[ConstraintSe
     branched on at all.
     """
     if conflict.other is None:
-        if conflict.type == "unreachable_goal":
+        if conflict.type in ("unreachable_goal", "closure"):
+            # A statically unreachable goal and a temporary closure are facts
+            # about the fleet, not disagreements between agents: no child
+            # constraint can make either one go away, so the node is a leaf.
             return []
         pairs = [(conflict.agent, True)]
     else:

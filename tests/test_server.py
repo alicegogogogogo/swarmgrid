@@ -146,6 +146,55 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("conflict", error["error"]["code"])
 
+    def test_temporary_closure_is_honoured_over_http(self):
+        self.call("POST", "/maps", {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "k1")
+        self.call(
+            "POST",
+            "/missions",
+            {"id": "run", "map_id": "lane",
+             "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}]},
+            "k2",
+        )
+        body = {"closures": [{"cells": [[1, 0]], "start_tick": 1, "end_tick": 1}]}
+        status, plan = self.call("POST", "/missions/run/plan", body, "k3")
+        self.assertEqual(200, status)
+        self.assertEqual("solved", plan["status"])
+        self.assertEqual(5, plan["makespan"])
+        self.assertEqual(
+            [[0, 0], [0, 0], [1, 0], [2, 0], [3, 0], [4, 0]], plan["agents"][0]["path"]
+        )
+
+    def test_start_closure_returns_closure_conflict_over_http(self):
+        self.call("POST", "/maps", {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "k1")
+        self.call(
+            "POST",
+            "/missions",
+            {"id": "run", "map_id": "lane",
+             "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}]},
+            "k2",
+        )
+        body = {"closures": [{"cells": [[1, 0], [2, 0], [3, 0]], "start_tick": 0, "end_tick": 100000}]}
+        status, plan = self.call("POST", "/missions/run/plan", body, "k3")
+        self.assertEqual(200, status)
+        self.assertEqual("unsolvable", plan["status"])
+        self.assertIsNone(plan["makespan"])
+        self.assertEqual("closure", plan["conflicts"][0]["type"])
+        self.assertIsNone(plan["conflicts"][0]["other"])
+
+    def test_invalid_closure_is_a_validation_error_over_http(self):
+        self.call("POST", "/maps", {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "k1")
+        self.call(
+            "POST",
+            "/missions",
+            {"id": "run", "map_id": "lane",
+             "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}]},
+            "k2",
+        )
+        body = {"closures": [{"cells": [[9, 0]], "start_tick": 0, "end_tick": 1}]}
+        status, error = self.call("POST", "/missions/run/plan", body, "k3")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", error["error"]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

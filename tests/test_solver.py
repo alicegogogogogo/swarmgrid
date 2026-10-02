@@ -1,10 +1,11 @@
 import unittest
 
-from swarmgrid.model import Map, Mission
+from swarmgrid.model import Map, Mission, parse_closures
 from swarmgrid.solver import (
     detect_conflicts,
     distance_map,
     makespan,
+    plan_mission,
     position_at,
     space_time_astar,
 )
@@ -190,6 +191,168 @@ class JointPlanningTests(unittest.TestCase):
         self.assertEqual("solved", result.status)
         self.assertEqual("priority", result.method)
         self.assertEqual(5, result.solution_makespan)
+
+
+LANE = {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}
+
+
+class ClosureTests(unittest.TestCase):
+    def test_single_agent_waits_out_a_one_tick_closure(self):
+        map_record, mission = build(
+            LANE, [{"id": "a", "start": [0, 0], "goal": [4, 0]}]
+        )
+        closures = parse_closures([{"cells": [[1, 0]], "start_tick": 1, "end_tick": 1}], map_record)
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("solved", result.status)
+        self.assertEqual(
+            ((0, 0), (0, 0), (1, 0), (2, 0), (3, 0), (4, 0)), result.paths[0]
+        )
+
+    def test_the_cell_is_free_again_after_the_interval(self):
+        map_record, mission = build(
+            LANE, [{"id": "a", "start": [0, 0], "goal": [4, 0]}]
+        )
+        # Closed only at t=1: one wait. Closed at t=2: arrive one tick later by
+        # waiting, never occupying the cell on the closed tick.
+        closures = parse_closures([{"cells": [[2, 0]], "start_tick": 2, "end_tick": 2}], map_record)
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("solved", result.status)
+        path = result.paths[0]
+        self.assertNotEqual((2, 0), path[2])
+        self.assertEqual(5, makespan([path]))
+
+    def test_a_permanent_closure_is_an_unsolvable_closure_conflict(self):
+        map_record, mission = build(
+            LANE, [{"id": "a", "start": [0, 0], "goal": [4, 0]}]
+        )
+        closures = parse_closures(
+            [{"cells": [[1, 0], [2, 0], [3, 0]], "start_tick": 0, "end_tick": 100000}],
+            map_record,
+        )
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("unsolvable", result.status)
+        self.assertEqual((), result.paths)
+        conflict = result.conflicts[0]
+        self.assertEqual("closure", conflict.type)
+        self.assertIsNone(conflict.other)
+        self.assertIsNone(conflict.other_position)
+        self.assertEqual("a", conflict.agent)
+        self.assertEqual(1, conflict.timestep)
+        self.assertEqual((1, 0), conflict.position)
+
+    def test_a_start_covered_at_tick_zero_is_diagnosed_per_agent_sorted(self):
+        map_record, mission = build(
+            LANE,
+            [
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+            ],
+        )
+        closures = parse_closures(
+            [{"cells": [[0, 0], [4, 0]], "start_tick": 0, "end_tick": 3}], map_record
+        )
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("unsolvable", result.status)
+        self.assertEqual(0, result.orders_tried)
+        self.assertEqual(
+            [
+                ("closure", 0, "a", (0, 0)),
+                ("closure", 0, "b", (4, 0)),
+            ],
+            [(c.type, c.timestep, c.agent, c.position) for c in result.conflicts],
+        )
+        for conflict in result.conflicts:
+            self.assertIsNone(conflict.other)
+            self.assertIsNone(conflict.other_position)
+
+    def test_only_the_agent_whose_start_is_closed_is_diagnosed(self):
+        map_record, mission = build(
+            LANE,
+            [
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+            ],
+        )
+        # Only b's start is closed at t=0; a remains free to move.
+        closures = parse_closures([{"cells": [[4, 0]], "start_tick": 0, "end_tick": 0}], map_record)
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("unsolvable", result.status)
+        self.assertEqual(
+            [("closure", 0, "b", (4, 0))],
+            [(c.type, c.timestep, c.agent, c.position) for c in result.conflicts],
+        )
+
+    def test_a_closure_starting_after_tick_zero_does_not_block_the_start(self):
+        map_record, mission = build(
+            LANE, [{"id": "a", "start": [0, 0], "goal": [4, 0]}]
+        )
+        closures = parse_closures([{"cells": [[0, 0]], "start_tick": 1, "end_tick": 1}], map_record)
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("solved", result.status)
+        # The agent simply leaves its start at t=0; it never waits on the closed
+        # cell at t=1.
+        self.assertNotEqual((0, 0), result.paths[0][1])
+
+    def test_a_closure_after_the_agent_finishes_is_irrelevant(self):
+        map_record, mission = build(
+            LANE, [{"id": "a", "start": [0, 0], "goal": [4, 0]}]
+        )
+        closures = parse_closures([{"cells": [[4, 0]], "start_tick": 10, "end_tick": 20}], map_record)
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("solved", result.status)
+        self.assertEqual(4, result.solution_makespan)
+
+    def test_closures_are_honoured_by_the_constraint_tree(self):
+        from swarmgrid.solver import _constraint_tree
+
+        map_record, mission = build(
+            OPEN_2X2,
+            [
+                {"id": "a0", "start": [0, 0], "goal": [1, 1]},
+                {"id": "a1", "start": [1, 0], "goal": [0, 0]},
+            ],
+        )
+        agents = tuple(sorted(mission.agents, key=lambda agent: agent.id))
+        distances = {agent.goal: distance_map(map_record, agent.goal) for agent in agents}
+        closures = parse_closures([{"cells": [[0, 1]], "start_tick": 1, "end_tick": 1}], map_record)
+        paths, conflicts = _constraint_tree(map_record, agents, distances, 64, closures=closures)
+        self.assertEqual([], conflicts)
+        self.assertEqual([], detect_conflicts(agents, paths))
+        for path in paths:
+            self.assertNotEqual((0, 1), position_at(path, 1))
+
+    def test_closures_keep_planning_deterministic(self):
+        map_record, mission = build(
+            OPEN_2X2,
+            [
+                {"id": "a0", "start": [0, 0], "goal": [1, 1]},
+                {"id": "a1", "start": [1, 0], "goal": [0, 0]},
+            ],
+        )
+        payload = [{"cells": [[0, 1]], "start_tick": 2, "end_tick": 3}]
+        first = plan_mission(map_record, mission, closures=parse_closures(payload, map_record))
+        second = plan_mission(map_record, mission, closures=parse_closures(payload, map_record))
+        self.assertEqual(first, second)
+
+    def test_closures_route_two_agents_without_collisions(self):
+        map_record, mission = build(
+            {"id": "c", "width": 5, "height": 3, "grid": [".....", "..##.", "....."]},
+            [
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+            ],
+        )
+        closures = parse_closures(
+            [{"cells": [[4, 1], [4, 2]], "start_tick": 0, "end_tick": 1}], map_record
+        )
+        result = plan_mission(map_record, mission, closures=closures)
+        self.assertEqual("solved", result.status)
+        agents = tuple(sorted(mission.agents, key=lambda agent: agent.id))
+        self.assertEqual([], detect_conflicts(agents, list(result.paths)))
+        for path in result.paths:
+            for timestep, cell in enumerate(path):
+                if timestep <= 1:
+                    self.assertNotIn(cell, ((4, 1), (4, 2)))
 
 
 def _agent(agent_id, start, goal):

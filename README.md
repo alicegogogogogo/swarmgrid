@@ -16,6 +16,11 @@ The initial release intentionally supports a compact public contract:
   includes two agents trying to settle on the same goal cell;
 - an **edge swap** is two agents crossing the same edge in opposite directions
   in one timestep;
+- a **temporary closure** is a set of cells that no agent may move into, wait
+  on, or hold during a closed tick interval `[start_tick, end_tick]`. Closures
+  are supplied per plan request; outside the interval the cells are ordinary
+  walkable cells, and every closure is treated as a fleet-wide space-time
+  obstacle by both planning stages;
 - following is legal: an agent may move into a cell another agent leaves on the
   same tick, because the two never share the cell;
 - planning is prioritized planning: agents are planned in priority order and the
@@ -152,7 +157,7 @@ Content-Type: application/json
 {}
 ```
 
-The body is optional; an empty object is enough. The body accepts exactly three
+The body is optional; an empty object is enough. The body accepts exactly four
 optional fields:
 
 - `priority` — an explicit priority order: every agent id of the mission,
@@ -161,6 +166,28 @@ optional fields:
   between 1 and 5040 (default 24, capped by the factorial of the agent count).
 - `tree_budget` — how many nodes the conflict-tree stage may expand, an integer
   between 0 and 4096 (default 64). Raise it to search harder before giving up.
+- `closures` — task-level temporary road closures, an array of up to 64 entries
+  (default none). Each entry contains exactly `cells`, `start_tick`, and
+  `end_tick`:
+  - `cells` is a non-empty array of pairwise distinct `[x, y]` pairs, at most
+    64 cells. Every cell must be inside the map and may not be a static
+    obstacle;
+  - `start_tick` and `end_tick` are integers with
+    `0 <= start_tick <= end_tick <= 100000`.
+
+  The interval is closed: during `start_tick..end_tick` (inclusive) none of the
+  listed cells may be moved into, waited on, or held by any agent. The cells are
+  ordinary walkable cells outside the interval. Closures are part of the
+  request body for determinism: the same map, mission, and body (closures
+  included) always return the same plan, and omitting `closures` means no
+  temporary closures.
+
+For example, this body makes the agent hold for one tick before entering the
+cell at `[1, 0]`, which is closed exactly at tick 1:
+
+```json
+{"closures": [{"cells": [[1, 0]], "start_tick": 1, "end_tick": 1}]}
+```
 
 A solved response (HTTP 200):
 
@@ -244,13 +271,20 @@ trade ends:
 no path data is returned. `conflicts` is sorted and de-duplicated, and each
 entry has these fields:
 
-- `type` is `vertex`, `edge`, or `unreachable_goal`;
+- `type` is `vertex`, `edge`, `closure`, or `unreachable_goal`;
 - `timestep` is the timestep at which the collision occurs, or the tick that
   blocks the agent; `0` for an `unreachable_goal`;
 - `agent` is the agent that could not be routed;
 - `other` is the other agent involved, or `null`;
 - `position` and `other_position` are the cells involved, or `null`;
 - `message` is a human readable sentence.
+
+A `closure` entry means a temporary closure stopped the agent: `timestep` and
+`position` name the forbidden tick and cell, while `other` and
+`other_position` are `null`. When a closure with `start_tick` 0 covers an
+agent's start, the agent has no legal first state, so the response carries one
+diagnostic per blocked agent with `timestep` 0 and `position` equal to that
+start, ordered by `agent_id`.
 
 Plans are deterministic: the same map, mission, and request body always return
 the same plan. Only solved plans are stored; plan an `unsolvable` mission again
@@ -301,7 +335,8 @@ before responding and returns `conflict` rather than serving a broken plan:
 
 1. each path is continuous (consecutive cells are identical or 4-adjacent),
    starts on the agent's start cell, and ends on its goal cell;
-2. no path ever enters an obstacle or leaves the map;
+2. no path ever enters an obstacle, leaves the map, or occupies a cell during a
+   tick on which a requested temporary closure closes that cell;
 3. no two agents occupy the same cell at the same timestep, and two agents can
    never settle on one cell;
 4. no two agents trade cells along an edge in one timestep;
