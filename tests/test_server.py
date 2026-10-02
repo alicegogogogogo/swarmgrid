@@ -146,6 +146,40 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("conflict", error["error"]["code"])
 
+    def test_temporary_closures_are_honoured_over_http(self):
+        self.call("POST", "/maps", {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "k1")
+        self.call(
+            "POST",
+            "/missions",
+            {"id": "go", "map_id": "lane", "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}]},
+            "k2",
+        )
+        # a malformed closure on a not-yet-solved mission is a validation error.
+        status, error = self.call(
+            "POST",
+            "/missions/go/plan",
+            {"closures": [{"cells": [[2, 0]], "start_tick": 9, "end_tick": 0}]},
+            "k4",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", error["error"]["code"])
+        body = {"closures": [{"cells": [[2, 0]], "start_tick": 2, "end_tick": 2}]}
+        status, plan = self.call("POST", "/missions/go/plan", body, "k3")
+        self.assertEqual(200, status)
+        self.assertEqual("solved", plan["status"])
+        self.assertEqual(5, plan["makespan"])
+        path = plan["agents"][0]["path"]
+        self.assertNotEqual([2, 0], path[2])
+        # an unknown mission is still not found with a closure body.
+        status, error = self.call(
+            "POST",
+            "/missions/ghost/plan",
+            {"closures": [{"cells": [[0, 0]], "start_tick": 0, "end_tick": 0}]},
+            "k5",
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", error["error"]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

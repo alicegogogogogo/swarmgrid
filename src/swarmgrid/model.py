@@ -9,6 +9,9 @@ MAX_IDENTIFIER = 100
 MAX_DIMENSION = 64
 MAX_CELLS = 4096
 MAX_AGENTS = 32
+MAX_CLOSURES = 64
+MAX_CLOSURE_CELLS = 64
+MAX_TICK = 100_000
 
 Point = tuple[int, int]
 
@@ -186,3 +189,67 @@ class Mission:
 
     def as_dict(self) -> dict[str, Any]:
         return {"id": self.id, "map_id": self.map_id, "agents": [agent.as_dict() for agent in self.agents]}
+
+
+@dataclass(frozen=True)
+class Closure:
+    """A temporary road block: `cells` are closed during the closed tick interval.
+
+    The interval is inclusive on both ends: at every timestep `t` with
+    `start_tick <= t <= end_tick` none of the cells may be entered, waited on, or
+    held. Outside the interval the cells are ordinary walkable ground.
+    """
+
+    cells: tuple[Point, ...]
+    start_tick: int
+    end_tick: int
+
+    @classmethod
+    def parse(cls, raw: Any, map_record: Map, field: str) -> "Closure":
+        if not isinstance(raw, dict):
+            raise ValidationError(f"{field} must be an object")
+        unknown = sorted(set(raw) - {"cells", "start_tick", "end_tick"})
+        if unknown:
+            raise ValidationError(f"{field} contains unknown fields: {', '.join(unknown)}")
+        missing = sorted({"cells", "start_tick", "end_tick"} - set(raw))
+        if missing:
+            raise ValidationError(f"{field} is missing required fields: {', '.join(missing)}")
+        start_tick = integer(raw["start_tick"], f"{field}.start_tick", 0, MAX_TICK)
+        end_tick = integer(raw["end_tick"], f"{field}.end_tick", 0, MAX_TICK)
+        if start_tick > end_tick:
+            raise ValidationError(f"{field}.start_tick must be less than or equal to end_tick")
+        raw_cells = raw["cells"]
+        if not isinstance(raw_cells, list) or not raw_cells:
+            raise ValidationError(f"{field}.cells must be a non-empty array")
+        if len(raw_cells) > MAX_CLOSURE_CELLS:
+            raise ValidationError(f"{field}.cells may not exceed {MAX_CLOSURE_CELLS} cells")
+        cells = tuple(
+            point(entry, f"{field}.cells[{index}]", map_record.width, map_record.height)
+            for index, entry in enumerate(raw_cells)
+        )
+        if len(set(cells)) != len(cells):
+            raise ValidationError(f"{field}.cells must not repeat a cell")
+        for cell in cells:
+            if not map_record.walkable(cell):
+                raise ValidationError(f"{field}.cells {list(cell)} is an obstacle cell")
+        return cls(cells, start_tick, end_tick)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cells": [list(cell) for cell in self.cells],
+            "start_tick": self.start_tick,
+            "end_tick": self.end_tick,
+        }
+
+
+def parse_closures(raw: Any, map_record: Map) -> tuple[Closure, ...]:
+    """Validate the optional `closures` field of a plan request."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValidationError("closures must be an array")
+    if len(raw) > MAX_CLOSURES:
+        raise ValidationError(f"closures may not exceed {MAX_CLOSURES} entries")
+    return tuple(
+        Closure.parse(entry, map_record, f"closures[{index}]") for index, entry in enumerate(raw)
+    )

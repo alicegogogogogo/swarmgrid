@@ -1,15 +1,21 @@
 import unittest
 
-from swarmgrid.model import Map, Mission
+from swarmgrid.model import Closure, Map, Mission
 from swarmgrid.solver import (
+    ClosureTable,
     detect_conflicts,
     distance_map,
     makespan,
+    plan_mission,
     position_at,
     space_time_astar,
 )
 
 OPEN_2X2 = {"id": "square", "width": 2, "height": 2, "grid": ["..", ".."]}
+
+
+def closure(cells, start, end):
+    return Closure(tuple(tuple(cell) for cell in cells), start, end)
 
 
 def build(map_payload, agents, mission_id="m"):
@@ -190,6 +196,155 @@ class JointPlanningTests(unittest.TestCase):
         self.assertEqual("solved", result.status)
         self.assertEqual("priority", result.method)
         self.assertEqual(5, result.solution_makespan)
+
+
+class ClosureTableTests(unittest.TestCase):
+    def test_interval_is_inclusive_on_both_ends(self):
+        table = ClosureTable([closure([[1, 0]], 2, 4)])
+        self.assertFalse(table.blocks((1, 0), 1))
+        self.assertTrue(table.blocks((1, 0), 2))
+        self.assertTrue(table.blocks((1, 0), 3))
+        self.assertTrue(table.blocks((1, 0), 4))
+        self.assertFalse(table.blocks((1, 0), 5))
+        self.assertFalse(table.blocks((0, 0), 3))
+
+    def test_overlapping_closures_combine(self):
+        table = ClosureTable([closure([[1, 0]], 0, 2), closure([[1, 0], [2, 0]], 2, 5)])
+        self.assertTrue(table.blocks((1, 0), 0))
+        self.assertTrue(table.blocks((1, 0), 5))
+        self.assertFalse(table.blocks((2, 0), 1))
+        self.assertTrue(table.blocks((2, 0), 3))
+
+
+class SingleAgentClosureTests(unittest.TestCase):
+    def test_agent_waits_until_a_temporary_gate_opens(self):
+        map_record, mission = build(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]},
+            [{"id": "a", "start": [0, 0], "goal": [4, 0]}],
+        )
+        agent = mission.agents[0]
+        table = ClosureTable([closure([[2, 0]], 2, 2)])
+        path, conflict = space_time_astar(
+            map_record, agent, [], distance_map(map_record, agent.goal), closures=table
+        )
+        self.assertIsNone(conflict)
+        # The agent waits one tick before entering the gate cell.
+        self.assertEqual(((0, 0), (1, 0), (1, 0), (2, 0), (3, 0), (4, 0)), path)
+        for timestep, cell in enumerate(path):
+            self.assertFalse(table.blocks(cell, timestep))
+
+    def test_closure_after_arrival_does_not_change_the_plan(self):
+        map_record, mission = build(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]},
+            [{"id": "a", "start": [0, 0], "goal": [4, 0]}],
+        )
+        result = plan_mission(map_record, mission, closures=[closure([[2, 0]], 50, 60)])
+        self.assertEqual("solved", result.status)
+        self.assertEqual(4, result.solution_makespan)
+
+    def test_a_sealed_corridor_is_reported_as_a_closure_conflict(self):
+        map_record, mission = build(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]},
+            [{"id": "a", "start": [0, 0], "goal": [4, 0]}],
+        )
+        result = plan_mission(map_record, mission, closures=[closure([[2, 0]], 0, 40)])
+        self.assertEqual("unsolvable", result.status)
+        self.assertEqual(1, len(result.conflicts))
+        blocked = result.conflicts[0]
+        self.assertEqual("closure", blocked.type)
+        self.assertEqual("a", blocked.agent)
+        self.assertEqual((2, 0), blocked.position)
+        self.assertIsNone(blocked.other)
+        self.assertIsNone(blocked.other_position)
+        self.assertEqual(2, blocked.timestep)
+
+    def test_start_covered_by_a_tick_zero_closure_is_diagnosed_up_front(self):
+        map_record, mission = build(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]},
+            [{"id": "a", "start": [0, 0], "goal": [4, 0]}],
+        )
+        result = plan_mission(map_record, mission, closures=[closure([[0, 0]], 0, 3)])
+        self.assertEqual("unsolvable", result.status)
+        self.assertEqual(0, result.orders_tried)
+        blocked = result.conflicts[0]
+        self.assertEqual(("closure", 0, "a", (0, 0)), (blocked.type, blocked.timestep, blocked.agent, blocked.position))
+
+    def test_start_closure_that_opens_after_zero_does_not_seal(self):
+        map_record, mission = build(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]},
+            [{"id": "a", "start": [0, 0], "goal": [4, 0]}],
+        )
+        result = plan_mission(map_record, mission, closures=[closure([[0, 0]], 1, 2)])
+        self.assertEqual("solved", result.status)
+        path = result.paths[0]
+        self.assertNotEqual(path[1], (0, 0))
+
+
+class JointClosureTests(unittest.TestCase):
+    def _crossing_mission(self):
+        return build(
+            {"id": "c", "width": 5, "height": 3, "grid": [".....", "..##.", "....."]},
+            [
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+            ],
+        )
+
+    def test_every_published_plan_avoids_the_closed_cells(self):
+        map_record, mission = self._crossing_mission()
+        result = plan_mission(
+            map_record, mission, closures=[closure([[2, 0], [3, 0]], 0, 2)]
+        )
+        self.assertEqual("solved", result.status)
+        agents = tuple(sorted(mission.agents, key=lambda agent: agent.id))
+        self.assertEqual([], list(detect_conflicts(agents, list(result.paths))))
+        closed = {(2, 0), (3, 0)}
+        for path in result.paths:
+            for timestep, cell in enumerate(path):
+                self.assertFalse(timestep <= 2 and cell in closed)
+
+    def test_multiple_sealed_starts_are_reported_sorted_by_agent_id(self):
+        map_record, mission = self._crossing_mission()
+        result = plan_mission(
+            map_record, mission, closures=[closure([[0, 0], [4, 0]], 0, 0)]
+        )
+        self.assertEqual("unsolvable", result.status)
+        self.assertEqual(0, result.orders_tried)
+        self.assertEqual(
+            [("closure", 0, "a", (0, 0)), ("closure", 0, "b", (4, 0))],
+            [
+                (conflict.type, conflict.timestep, conflict.agent, conflict.position)
+                for conflict in result.conflicts
+            ],
+        )
+
+    def test_a_timed_gate_is_handled_by_the_constraint_tree(self):
+        map_record, mission = build(
+            {"id": "open", "width": 4, "height": 2, "grid": ["....", "...."]},
+            [
+                {"id": "a", "start": [0, 0], "goal": [3, 0]},
+                {"id": "b", "start": [3, 0], "goal": [0, 0]},
+            ],
+        )
+        result = plan_mission(
+            map_record,
+            mission,
+            tree_budget=4096,
+            closures=[closure([[0, 1], [1, 1], [2, 1], [3, 1]], 0, 3)],
+        )
+        self.assertEqual("solved", result.status)
+        agents = tuple(sorted(mission.agents, key=lambda agent: agent.id))
+        self.assertEqual([], list(detect_conflicts(agents, list(result.paths))))
+        for path in result.paths:
+            for timestep, cell in enumerate(path):
+                self.assertFalse(timestep <= 3 and cell[1] == 1)
+
+    def test_closures_keep_the_plan_deterministic(self):
+        map_record, mission = self._crossing_mission()
+        payload = [closure([[2, 0]], 1, 2)]
+        first = plan_mission(map_record, mission, closures=payload)
+        second = plan_mission(map_record, mission, closures=payload)
+        self.assertEqual(first, second)
 
 
 def _agent(agent_id, start, goal):

@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Agent, Map, Mission, identifier
+from .model import Agent, Map, Mission, identifier, parse_closures
 from .solver import (
     DEFAULT_ORDER_BUDGET,
     DEFAULT_TREE_BUDGET,
+    ClosureTable,
     detect_conflicts,
     plan_mission,
     position_at,
@@ -126,10 +127,14 @@ class SwarmGrid:
 
             map_record = self._load_map(state["map_id"])
             mission = self._rebuild_mission(state)
-            requested, order_budget, tree_budget = self._plan_options(raw, mission)
-            result = plan_mission(map_record, mission, requested, order_budget, tree_budget)
+            requested, order_budget, tree_budget, closures = self._plan_options(
+                raw, mission, map_record
+            )
+            result = plan_mission(
+                map_record, mission, requested, order_budget, tree_budget, closures
+            )
             plan = self._materialize(mission, result)
-            self._assert_plan_invariants(mission, plan)
+            self._assert_plan_invariants(mission, plan, closures)
 
             if result.status == "solved":
                 state["status"] = "solved"
@@ -181,12 +186,14 @@ class SwarmGrid:
     # internals
     # ------------------------------------------------------------------ #
 
-    def _plan_options(self, raw: Any, mission: Mission) -> tuple[list[str] | None, int, int]:
+    def _plan_options(self, raw: Any, mission: Mission, map_record: Map) -> tuple[
+        list[str] | None, int, int, tuple
+    ]:
         if raw is None:
-            return None, DEFAULT_ORDER_BUDGET, DEFAULT_TREE_BUDGET
+            return None, DEFAULT_ORDER_BUDGET, DEFAULT_TREE_BUDGET, ()
         if not isinstance(raw, dict):
             raise ValidationError("plan body must be an object")
-        unknown = sorted(set(raw) - {"priority", "order_budget", "tree_budget"})
+        unknown = sorted(set(raw) - {"priority", "order_budget", "tree_budget", "closures"})
         if unknown:
             raise ValidationError(f"plan body contains unknown fields: {', '.join(unknown)}")
         known = sorted(agent.id for agent in mission.agents)
@@ -211,7 +218,13 @@ class SwarmGrid:
             or tree_budget > MAX_TREE_BUDGET
         ):
             raise ValidationError(f"tree_budget must be an integer between 0 and {MAX_TREE_BUDGET}")
-        return (list(priority) if priority is not None else None), budget, tree_budget
+        closures = parse_closures(raw.get("closures"), map_record)
+        return (
+            list(priority) if priority is not None else None,
+            budget,
+            tree_budget,
+            closures,
+        )
 
     def _rebuild_mission(self, state: dict[str, Any]) -> Mission:
         raw = {
@@ -260,11 +273,14 @@ class SwarmGrid:
             "conflicts": [conflict.as_dict() for conflict in result.conflicts],
         }
 
-    def _assert_plan_invariants(self, mission: Mission, plan: dict[str, Any]) -> None:
+    def _assert_plan_invariants(
+        self, mission: Mission, plan: dict[str, Any], closures: tuple = ()
+    ) -> None:
         """Fail loudly rather than publish a plan that breaks the documented invariants."""
         if plan["status"] != "solved":
             return
         map_record = self._load_map(mission.map_id)
+        table = ClosureTable(closures)
         by_id = {agent.id: agent for agent in mission.agents}
         order: list[Agent] = []
         paths: list[tuple[tuple[int, int], ...]] = []
@@ -276,6 +292,8 @@ class SwarmGrid:
             for index, cell in enumerate(path):
                 if not map_record.walkable(cell):
                     raise ConflictError("internal planner error: a path crosses an obstacle")
+                if table.blocks(cell, index):
+                    raise ConflictError("internal planner error: a path occupies a temporarily closed cell")
                 if index and abs(path[index - 1][0] - cell[0]) + abs(path[index - 1][1] - cell[1]) > 1:
                     raise ConflictError("internal planner error: a path is not continuous")
             if entry["arrival"] != len(path) - 1:

@@ -476,6 +476,165 @@ class PlanningTests(unittest.TestCase):
         with self.assertRaisesRegex(ConflictError, "no solved plan"):
             self.service.schedule("swap")
 
+class ClosureValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = SwarmGrid(str(Path(self.directory.name) / "test.db"))
+        self.service.create_map(corridor_map(), "map-1")
+        self.service.create_mission(
+            {
+                "id": "m1",
+                "map_id": "corridor",
+                "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}],
+            },
+            "mission-m1",
+        )
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def plan(self, closures, key):
+        return self.service.plan("m1", {"closures": closures}, key)
+
+    def test_cells_must_be_a_non_empty_array_of_unique_in_bounds_points(self):
+        cases = [
+            ([{"start_tick": 0, "end_tick": 0}], "missing required fields"),
+            ([{"cells": [], "start_tick": 0, "end_tick": 0}], "non-empty array"),
+            ([{"cells": [[2, 0], [2, 0]], "start_tick": 0, "end_tick": 0}], "must not repeat"),
+            ([{"cells": [[9, 0]], "start_tick": 0, "end_tick": 0}], "between 0 and 4"),
+            ([{"cells": [[2, 1]], "start_tick": 0, "end_tick": 0}], "obstacle cell"),
+            ([{"cells": [2, 0], "start_tick": 0, "end_tick": 0}], r"\[x, y\] pair"),
+        ]
+        for index, (closures, pattern) in enumerate(cases):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValidationError, pattern):
+                    self.plan(closures, f"k{index}")
+
+    def test_ticks_are_bounded_and_ordered(self):
+        cases = [
+            ([[{"cells": [[2, 0]], "start_tick": -1, "end_tick": 0}]], "between 0 and"),
+            ([[{"cells": [[2, 0]], "start_tick": 0, "end_tick": 100001}]], "between 0 and"),
+            ([[{"cells": [[2, 0]], "start_tick": 3, "end_tick": 2}]], "less than or equal"),
+            ([[{"cells": [[2, 0]], "start_tick": True, "end_tick": 0}]], "must be an integer"),
+            ([[{"cells": [[2, 0]], "start_tick": 0, "end_tick": "0"}]], "must be an integer"),
+        ]
+        for index, (closures, pattern) in enumerate(cases):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValidationError, pattern):
+                    self.plan(closures[0], f"k{index}")
+
+    def test_array_and_entry_limits_are_enforced(self):
+        too_many_cells = [{"cells": [[0, 0]] * 65, "start_tick": 0, "end_tick": 0}]
+        with self.assertRaisesRegex(ValidationError, "64 cells"):
+            self.plan(too_many_cells, "k-cells")
+        too_many_entries = [
+            {"cells": [[0, 0]], "start_tick": index, "end_tick": index} for index in range(65)
+        ]
+        with self.assertRaisesRegex(ValidationError, "64 entries"):
+            self.plan(too_many_entries, "k-entries")
+
+    def test_shape_and_unknown_fields_are_rejected(self):
+        with self.assertRaisesRegex(ValidationError, "closures must be an array"):
+            self.service.plan("m1", {"closures": {"cells": []}}, "k-shape")
+        with self.assertRaisesRegex(ValidationError, "closures\\[0\\] must be an object"):
+            self.plan(["nope"], "k-item")
+        with self.assertRaisesRegex(ValidationError, "unknown fields"):
+            self.plan([{"cells": [[2, 0]], "start_tick": 0, "end_tick": 0, "note": "x"}], "k-unknown")
+
+    def test_closures_combine_with_the_other_plan_options(self):
+        plan = self.service.plan(
+            "m1",
+            {"priority": ["a"], "order_budget": 1, "tree_budget": 0, "closures": []},
+            "k-combo",
+        )
+        self.assertEqual("solved", plan["status"])
+        self.assertEqual(["a"], plan["priority_order"])
+
+
+class ClosurePlanningTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = SwarmGrid(str(Path(self.directory.name) / "test.db"))
+        self.service.create_map(corridor_map(), "map-1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def create(self, mission_id, agents):
+        self.service.create_mission(
+            {"id": mission_id, "map_id": "corridor", "agents": agents}, f"mission-{mission_id}"
+        )
+
+    def test_agent_waits_for_a_temporary_closure_to_open(self):
+        self.create("m1", [{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        plan = self.service.plan(
+            "m1", {"closures": [{"cells": [[2, 0]], "start_tick": 2, "end_tick": 2}]}, "p1"
+        )
+        self.assertEqual("solved", plan["status"])
+        self.assertEqual(5, plan["makespan"])
+        path = plan["agents"][0]["path"]
+        for timestep, cell in enumerate(path):
+            self.assertFalse(timestep == 2 and cell == [2, 0])
+
+    def test_blocked_mission_reports_a_closure_conflict(self):
+        self.service.create_map(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "map-lane"
+        )
+        self.service.create_mission(
+            {"id": "lane-go", "map_id": "lane", "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}]},
+            "mission-lane",
+        )
+        plan = self.service.plan(
+            "lane-go", {"closures": [{"cells": [[2, 0]], "start_tick": 0, "end_tick": 40}]}, "p1"
+        )
+        self.assertEqual("unsolvable", plan["status"])
+        self.assertIsNone(plan["makespan"])
+        self.assertNotIn("agents", plan)
+        (conflict,) = plan["conflicts"]
+        self.assertEqual("closure", conflict["type"])
+        self.assertEqual(2, conflict["timestep"])
+        self.assertEqual("a", conflict["agent"])
+        self.assertEqual([2, 0], conflict["position"])
+        self.assertIsNone(conflict["other"])
+        self.assertIsNone(conflict["other_position"])
+
+    def test_sealed_start_returns_one_diagnostic_per_agent_sorted(self):
+        self.create(
+            "swap",
+            [
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+            ],
+        )
+        plan = self.service.plan(
+            "swap", {"closures": [{"cells": [[0, 0], [4, 0]], "start_tick": 0, "end_tick": 0}]}, "p1"
+        )
+        self.assertEqual("unsolvable", plan["status"])
+        self.assertEqual(0, plan["orders_tried"])
+        self.assertEqual(
+            [
+                {"type": "closure", "timestep": 0, "agent": "a", "position": [0, 0]},
+                {"type": "closure", "timestep": 0, "agent": "b", "position": [4, 0]},
+            ],
+            [
+                {key: conflict[key] for key in ("type", "timestep", "agent", "position")}
+                for conflict in plan["conflicts"]
+            ],
+        )
+        self.assertTrue(all(conflict["other"] is None for conflict in plan["conflicts"]))
+
+    def test_closure_plan_is_deterministic_and_idempotent(self):
+        self.create("m1", [{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        body = {"closures": [{"cells": [[2, 0]], "start_tick": 2, "end_tick": 2}]}
+        first = self.service.plan("m1", body, "same")
+        self.assertEqual(first, self.service.plan("m1", body, "same"))
+
+    def test_planning_an_unknown_mission_with_closures_is_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.plan(
+                "ghost", {"closures": [{"cells": [[0, 0]], "start_tick": 0, "end_tick": 0}]}, "p1"
+            )
+
     def test_plans_survive_a_service_restart(self):
         path = str(Path(self.directory.name) / "restart.db")
         first = SwarmGrid(path)
@@ -488,7 +647,9 @@ class PlanningTests(unittest.TestCase):
             },
             "k1",
         )
-        plan = first.plan("m1", {}, "k2")
+        plan = first.plan(
+            "m1", {"closures": [{"cells": [[2, 0]], "start_tick": 2, "end_tick": 2}]}, "k2"
+        )
         second = SwarmGrid(path)
         self.assertEqual(plan, second.plan("m1", {}, "k3"))
         self.assertEqual(plan["makespan"], second.schedule("m1")["makespan"])

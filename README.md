@@ -33,6 +33,10 @@ The initial release intentionally supports a compact public contract:
   conflicts are returned so the caller can see what stopped it, and the status
   is never faked in the other direction -- a `solved` response always carries a
   plan that satisfies every invariant below;
+- a plan request may attach temporary `closures`: cells that are impassable only
+  during a given inclusive tick interval. The planner waits or detours around
+  them exactly like moving walls, and an agent sealed on its start at tick zero
+  gets a `closure` diagnostic instead of a plan;
 - repeating a mutating request with the same idempotency key returns the first
   response.
 
@@ -152,8 +156,8 @@ Content-Type: application/json
 {}
 ```
 
-The body is optional; an empty object is enough. The body accepts exactly three
-optional fields:
+The body is optional; an empty object is enough. The body accepts four optional
+fields:
 
 - `priority` — an explicit priority order: every agent id of the mission,
   exactly once. When present the planner uses that order only.
@@ -161,6 +165,20 @@ optional fields:
   between 1 and 5040 (default 24, capped by the factorial of the agent count).
 - `tree_budget` — how many nodes the conflict-tree stage may expand, an integer
   between 0 and 4096 (default 64). Raise it to search harder before giving up.
+- `closures` — task-level temporary road blocks, an array of up to 64 entries.
+  Each entry contains exactly `cells`, `start_tick`, and `end_tick`:
+  - `cells` is a non-empty array of up to 64 unique `[x, y]` points, each inside
+    the map and not a static obstacle;
+  - `start_tick` and `end_tick` are integers with
+    `0 <= start_tick <= end_tick <= 100000`.
+
+  The tick interval is inclusive on both ends. During every timestep
+  `start_tick..end_tick` none of the listed cells may be entered, waited on, or
+  held by any agent; outside the interval the cells are ordinary ground. The
+  closures feed both the space-time search and conflict resolution, so a plan is
+  delayed or detoured around a closed cell rather than touching it. Omitting
+  `closures` (or sending `[]`) means no temporary closure, and the request is
+  then identical to the body-less case.
 
 A solved response (HTTP 200):
 
@@ -244,13 +262,25 @@ trade ends:
 no path data is returned. `conflicts` is sorted and de-duplicated, and each
 entry has these fields:
 
-- `type` is `vertex`, `edge`, or `unreachable_goal`;
+- `type` is `vertex`, `edge`, `unreachable_goal`, or `closure`;
 - `timestep` is the timestep at which the collision occurs, or the tick that
   blocks the agent; `0` for an `unreachable_goal`;
 - `agent` is the agent that could not be routed;
 - `other` is the other agent involved, or `null`;
 - `position` and `other_position` are the cells involved, or `null`;
 - `message` is a human readable sentence.
+
+A `closure` entry names a temporary road block that stops an agent: `timestep`
+is the first forbidden tick the search needs, `position` is the closed cell,
+`other` and `other_position` are `null`, and the message states that the closure
+blocks that agent. When an agent's start is covered by a closure whose
+`start_tick` is `0`, the agent cannot even occupy its first cell, so the
+mission is reported `unsolvable` without trying orders: one diagnostic per
+blocked agent is returned, sorted by `agent_id`, each with `timestep` `0` and
+`position` equal to that agent's start.
+
+A malformed `closures` value (bad shape, out-of-range ticks, an out-of-bounds or
+obstacle cell, too many entries or cells, and so on) is a `validation_error`.
 
 Plans are deterministic: the same map, mission, and request body always return
 the same plan. Only solved plans are stored; plan an `unsolvable` mission again
@@ -301,7 +331,8 @@ before responding and returns `conflict` rather than serving a broken plan:
 
 1. each path is continuous (consecutive cells are identical or 4-adjacent),
    starts on the agent's start cell, and ends on its goal cell;
-2. no path ever enters an obstacle or leaves the map;
+2. no path ever enters an obstacle or leaves the map, and no path occupies a cell
+   on a tick for which a temporary `closures` entry closes that cell;
 3. no two agents occupy the same cell at the same timestep, and two agents can
    never settle on one cell;
 4. no two agents trade cells along an edge in one timestep;
