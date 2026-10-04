@@ -3,14 +3,16 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Agent, Closure, Map, Mission, identifier, parse_closures
+from .model import MAX_TICK, Agent, Closure, Map, Mission, Point, identifier, integer, parse_closures, point
 from .solver import (
     Closures,
     DEFAULT_ORDER_BUDGET,
     DEFAULT_TREE_BUDGET,
+    ReplanResult,
     detect_conflicts,
     plan_mission,
     position_at,
+    replan_mission,
 )
 from .store import Store
 
@@ -182,6 +184,32 @@ class SwarmGrid:
             ],
         }
 
+    def replan(self, mission_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Replan `mission_id` from an execution snapshot.
+
+        The stored plan, mission state, and schedule are never touched: the
+        result is a stand-alone continuation of the saved solved plan from
+        `observed_tick` on, memoized only under the idempotency key.
+        """
+
+        def resolve() -> dict[str, Any]:
+            state, stored_plan = self._load_mission(mission_id)
+            if state["status"] != "solved" or stored_plan is None:
+                raise ConflictError(f"mission {mission_id} has no solved plan to replan from")
+            map_record = self._load_map(state["map_id"])
+            mission = self._rebuild_mission(state)
+            observed_tick, positions, order_budget, tree_budget, closures = self._replan_options(
+                raw, mission, map_record
+            )
+            result = replan_mission(
+                map_record, mission, positions, observed_tick, order_budget, tree_budget, closures
+            )
+            response = self._materialize_replan(mission, positions, observed_tick, result)
+            self._assert_replan_invariants(mission, positions, observed_tick, response, closures)
+            return response
+
+        return self._idempotent(key, f"replan-mission:{mission_id}", resolve)
+
     # ------------------------------------------------------------------ #
     # internals
     # ------------------------------------------------------------------ #
@@ -222,6 +250,71 @@ class SwarmGrid:
         return (
             list(priority) if priority is not None else None
         ), budget, tree_budget, closures
+
+    def _replan_options(
+        self, raw: Any, mission: Mission, map_record: Map
+    ) -> tuple[int, dict[str, Point], int, int, Closures]:
+        if not isinstance(raw, dict):
+            raise ValidationError("replan body must be an object")
+        unknown = sorted(
+            set(raw) - {"observed_tick", "positions", "closures", "order_budget", "tree_budget"}
+        )
+        if unknown:
+            raise ValidationError(f"replan body contains unknown fields: {', '.join(unknown)}")
+        for field in ("observed_tick", "positions"):
+            if field not in raw:
+                raise ValidationError(f"replan body is missing required field: {field}")
+        observed_tick = integer(raw["observed_tick"], "observed_tick", 0, MAX_TICK)
+        positions = self._snapshot_positions(raw["positions"], mission, map_record)
+        order_budget = raw.get("order_budget", DEFAULT_ORDER_BUDGET)
+        if (
+            isinstance(order_budget, bool)
+            or not isinstance(order_budget, int)
+            or order_budget < 1
+            or order_budget > MAX_ORDER_BUDGET
+        ):
+            raise ValidationError(
+                f"order_budget must be an integer between 1 and {MAX_ORDER_BUDGET}"
+            )
+        tree_budget = raw.get("tree_budget", DEFAULT_TREE_BUDGET)
+        if (
+            isinstance(tree_budget, bool)
+            or not isinstance(tree_budget, int)
+            or tree_budget < 0
+            or tree_budget > MAX_TREE_BUDGET
+        ):
+            raise ValidationError(
+                f"tree_budget must be an integer between 0 and {MAX_TREE_BUDGET}"
+            )
+        closures = parse_closures(raw.get("closures"), map_record)
+        for index, closure in enumerate(closures):
+            if closure.start_tick < observed_tick:
+                raise ValidationError(
+                    f"closures[{index}].start_tick must not be earlier than observed_tick"
+                )
+        return observed_tick, positions, order_budget, tree_budget, closures
+
+    def _snapshot_positions(
+        self, raw: Any, mission: Mission, map_record: Map
+    ) -> dict[str, Point]:
+        if not isinstance(raw, dict):
+            raise ValidationError("positions must be an object keyed by agent id")
+        known = {agent.id for agent in mission.agents}
+        unknown = sorted(set(raw) - known)
+        if unknown:
+            raise ValidationError(f"positions contains unknown agents: {', '.join(unknown)}")
+        missing = sorted(known - set(raw))
+        if missing:
+            raise ValidationError(f"positions is missing agents: {', '.join(missing)}")
+        positions: dict[str, Point] = {}
+        for agent_id in sorted(raw):
+            cell = point(raw[agent_id], f"positions[{agent_id}]", map_record.width, map_record.height)
+            if not map_record.walkable(cell):
+                raise ValidationError(f"positions[{agent_id}] {list(cell)} is an obstacle cell")
+            positions[agent_id] = cell
+        if len(set(positions.values())) != len(positions):
+            raise ValidationError("positions must place every agent on a distinct cell")
+        return positions
 
     def _rebuild_mission(self, state: dict[str, Any]) -> Mission:
         raw = {
@@ -310,6 +403,93 @@ class SwarmGrid:
             raise ConflictError("internal planner error: makespan is not the latest arrival")
         if detect_conflicts(tuple(order), paths):
             raise ConflictError("internal planner error: the published plan still has a conflict")
+
+    def _materialize_replan(
+        self,
+        mission: Mission,
+        positions: dict[str, Point],
+        observed_tick: int,
+        result: ReplanResult,
+    ) -> dict[str, Any]:
+        by_id = {agent.id: agent for agent in mission.agents}
+        if result.status == "solved":
+            agents = [
+                {
+                    "agent_id": agent_id,
+                    "start": list(positions[agent_id]),
+                    "goal": list(by_id[agent_id].goal),
+                    "arrival": observed_tick + len(result.paths[agent_id]) - 1,
+                    "path": [list(cell) for cell in result.paths[agent_id]],
+                }
+                for agent_id in sorted(result.paths)
+            ]
+            return {
+                "mission_id": mission.id,
+                "map_id": mission.map_id,
+                "status": "solved",
+                "method": result.method,
+                "makespan": max(entry["arrival"] for entry in agents),
+                "replan_from": observed_tick,
+                "priority_order": list(result.order),
+                "orders_tried": result.orders_tried,
+                "orders_budget": result.orders_budget,
+                "agents": agents,
+            }
+        return {
+            "mission_id": mission.id,
+            "map_id": mission.map_id,
+            "status": "unsolvable",
+            "method": None,
+            "makespan": None,
+            "replan_from": observed_tick,
+            "priority_order": [],
+            "orders_tried": result.orders_tried,
+            "orders_budget": result.orders_budget,
+            "conflicts": [conflict.as_dict() for conflict in result.conflicts],
+        }
+
+    def _assert_replan_invariants(
+        self,
+        mission: Mission,
+        positions: dict[str, Point],
+        observed_tick: int,
+        response: dict[str, Any],
+        closures: Closures = (),
+    ) -> None:
+        """The plan invariants, rebased so path index `i` is tick `observed_tick + i`."""
+        if response["status"] != "solved":
+            return
+        map_record = self._load_map(mission.map_id)
+        by_id = {agent.id: agent for agent in mission.agents}
+        paths: dict[str, tuple[Point, ...]] = {}
+        for entry in response["agents"]:
+            agent_id = entry["agent_id"]
+            path = tuple(tuple(cell) for cell in entry["path"])
+            if not path or path[0] != positions[agent_id] or path[-1] != by_id[agent_id].goal:
+                raise ConflictError(
+                    "internal planner error: a path does not join the snapshot to the goal"
+                )
+            for index, cell in enumerate(path):
+                if not map_record.walkable(cell):
+                    raise ConflictError("internal planner error: a path crosses an obstacle")
+                if index and abs(path[index - 1][0] - cell[0]) + abs(path[index - 1][1] - cell[1]) > 1:
+                    raise ConflictError("internal planner error: a path is not continuous")
+                tick = observed_tick + index
+                for closure in closures:
+                    if closure.start_tick <= tick <= closure.end_tick and cell in closure.cells_set:
+                        raise ConflictError(
+                            "internal planner error: a path occupies a temporarily closed cell"
+                        )
+            if entry["arrival"] != observed_tick + len(path) - 1:
+                raise ConflictError("internal planner error: arrival does not match the path length")
+            paths[agent_id] = path
+        if len({path[-1] for path in paths.values()}) != len(paths):
+            raise ConflictError("internal planner error: two agents settle on the same goal cell")
+        ordered = tuple(by_id[agent_id] for agent_id in sorted(paths))
+        if detect_conflicts(ordered, [paths[agent.id] for agent in ordered]):
+            raise ConflictError("internal planner error: the published plan still has a conflict")
+        if response["makespan"] != max(observed_tick + len(path) - 1 for path in paths.values()):
+            raise ConflictError("internal planner error: makespan is not the latest arrival")
 
     def _idempotent(
         self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]

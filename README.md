@@ -39,7 +39,9 @@ The initial release intentionally supports a compact public contract:
   is never faked in the other direction -- a `solved` response always carries a
   plan that satisfies every invariant below;
 - repeating a mutating request with the same idempotency key returns the first
-  response.
+  response;
+- an execution-snapshot replan continues a saved solved plan from the fleet's
+  observed positions at an observed tick, without modifying the stored plan.
 
 ## Requirements
 
@@ -291,6 +293,57 @@ the same plan. Only solved plans are stored; plan an `unsolvable` mission again
 to retry it (for example with a larger `order_budget` or `tree_budget`).
 Repeated planning of a solved mission returns the recorded plan and does not
 replan.
+
+### Replan from an execution snapshot
+
+```http
+POST /missions/shift-1/replan
+Idempotency-Key: shift-1-replan-7
+Content-Type: application/json
+
+{
+  "observed_tick": 3,
+  "positions": {"agv-1": [3, 0], "agv-2": [4, 2]},
+  "closures": [{"cells": [[4, 0]], "start_tick": 5, "end_tick": 6}],
+  "order_budget": 24,
+  "tree_budget": 64
+}
+```
+
+Recomputes a continuation of the mission's **saved solved plan** from where the
+fleet actually is, without overwriting anything: the mission's plan, status,
+`planned_at`, and schedule are never touched, and the replan result is only
+memoized under the idempotency key. The mission must exist (`not_found`
+otherwise) and must already hold a solved plan (`conflict` otherwise).
+
+The body accepts exactly five fields:
+
+- `observed_tick` (required) — the absolute mission tick the snapshot was taken
+  at, an integer between 0 and 100000.
+- `positions` (required) — an object keyed by agent id containing exactly the
+  mission's agents; each value is the agent's observed `[x, y]` cell at
+  `observed_tick`. Every cell must be walkable, and no two agents may share a
+  cell.
+- `closures` — same structure and limits as in the plan body, but the intervals
+  are absolute mission ticks and may not start before `observed_tick`.
+- `order_budget` and `tree_budget` — same defaults, ranges, and determinism as
+  in the plan body.
+
+An agent whose observed cell is already its goal counts as arrived at
+`observed_tick` and occupies only that tick; every other agent is replanned
+from its snapshot cell to its original goal, and all of them take part in
+vertex-conflict, edge-swap, and closure resolution exactly as in a fresh plan.
+A closure that covers an agent's observed cell at `observed_tick` is reported
+as a `closure` unsolvable diagnostic, not a validation error.
+
+A solved response carries the usual solved-plan fields plus `replan_from`
+(equal to `observed_tick`). Each `path` starts at the snapshot cell, which
+corresponds to `observed_tick`; `arrival` and `makespan` are absolute mission
+ticks; `agents` is sorted by `agent_id`; and `priority_order` is the order this
+run planned in. When no plan exists within the budgets the response is an HTTP
+200 `unsolvable` whose `conflicts` also use absolute ticks. The same mission
+and body always produce a byte-identical response, across idempotent replays
+and process restarts.
 
 ### Inspect a mission
 

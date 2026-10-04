@@ -31,6 +31,7 @@ sorted agent identifiers, so the same map and mission always yield one plan.
 from __future__ import annotations
 
 import heapq
+import re
 from dataclasses import dataclass
 from itertools import permutations
 from typing import Iterable
@@ -910,3 +911,131 @@ def _factorial(value: int) -> int:
     for factor in range(2, value + 1):
         total *= factor
     return total
+
+
+# --------------------------------------------------------------------------- #
+# execution-snapshot replanning
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ReplanResult:
+    """Outcome of replanning a solved mission from an execution snapshot.
+
+    `paths` covers every agent of the mission, keyed by agent id; each path is
+    indexed relative to `observed_tick`, so `path[0]` is the snapshot position
+    and an agent that was already on its goal has the single-cell path that
+    occupies exactly the observed tick. `conflicts` are reported with absolute
+    mission ticks.
+    """
+
+    status: str
+    method: str
+    order: tuple[str, ...]
+    paths: dict[str, Path]
+    conflicts: tuple[Conflict, ...]
+    orders_tried: int
+    orders_budget: int
+
+
+_TICK_REFERENCE = re.compile(r"t=(\d+)")
+
+
+def _shift_conflict(conflict: Conflict, offset: int) -> Conflict:
+    """Rebase a conflict reported in the relative frame onto absolute ticks.
+
+    Every tick a conflict message mentions is written as `t=<n>`, so shifting
+    the structured timestep and rewriting those references keeps the prose
+    consistent with the structured field.
+    """
+    if offset == 0:
+        return conflict
+    return Conflict(
+        conflict.type,
+        conflict.timestep + offset,
+        conflict.agent,
+        conflict.other,
+        conflict.position,
+        conflict.other_position,
+        _TICK_REFERENCE.sub(lambda match: f"t={int(match.group(1)) + offset}", conflict.message),
+    )
+
+
+def replan_mission(
+    map_record,
+    mission: Mission,
+    positions: dict[str, Point],
+    observed_tick: int,
+    order_budget: int = DEFAULT_ORDER_BUDGET,
+    tree_budget: int = DEFAULT_TREE_BUDGET,
+    closures: Closures = (),
+) -> ReplanResult:
+    """Replan `mission` from the observed `positions` at `observed_tick`.
+
+    The joint problem is shifted into a relative time frame that starts at
+    `observed_tick`: an agent whose observed position is already its goal has
+    arrived -- it occupies exactly that one tick and nothing later -- and every
+    other agent is planned from its snapshot cell to its original goal by the
+    same two-stage solver as :func:`plan_mission`, so vertex conflicts, edge
+    swaps, and closures are resolved identically. Closure intervals arrive as
+    absolute mission ticks (never starting before `observed_tick`) and are shifted
+    into the relative frame; reported conflicts are shifted back to absolute
+    ticks before returning.
+    """
+    shifted = tuple(
+        Closure(closure.cells, closure.start_tick - observed_tick, closure.end_tick - observed_tick)
+        for closure in closures
+    )
+    ordered = tuple(sorted(mission.agents, key=lambda agent: agent.id))
+    arrived = tuple(agent for agent in ordered if positions[agent.id] == agent.goal)
+    moving = tuple(agent for agent in ordered if positions[agent.id] != agent.goal)
+
+    # An arrived agent still occupies its cell at the observed tick, so a
+    # closure covering that cell at that tick denies it its only state; like a
+    # closure on a start cell, that is a fleet fact, so diagnose it directly.
+    blocked = tuple(
+        Conflict(
+            "closure",
+            observed_tick,
+            agent.id,
+            None,
+            positions[agent.id],
+            None,
+            f"agent {agent.id} is blocked on its observed position "
+            f"{list(positions[agent.id])} at t={observed_tick} by a temporary closure",
+        )
+        for agent in arrived
+        if any(
+            closure.start_tick == 0 and positions[agent.id] in closure.cells_set
+            for closure in shifted
+        )
+    )
+    if blocked:
+        return ReplanResult(
+            status="unsolvable",
+            method="none",
+            order=(),
+            paths={},
+            conflicts=tuple(sorted(blocked, key=lambda conflict: conflict.as_key())),
+            orders_tried=0,
+            orders_budget=_orders_budget(len(moving), order_budget, None),
+        )
+
+    snapshot = Mission(
+        mission.id,
+        mission.map_id,
+        tuple(Agent(agent.id, positions[agent.id], agent.goal) for agent in moving),
+    )
+    result = plan_mission(map_record, snapshot, None, order_budget, tree_budget, shifted)
+    paths = {agent_id: path for agent_id, path in zip(result.order, result.paths)}
+    for agent in arrived:
+        paths[agent.id] = (positions[agent.id],)
+    return ReplanResult(
+        status=result.status,
+        method=result.method,
+        order=result.order,
+        paths=paths,
+        conflicts=tuple(_shift_conflict(conflict, observed_tick) for conflict in result.conflicts),
+        orders_tried=result.orders_tried,
+        orders_budget=result.orders_budget,
+    )

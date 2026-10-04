@@ -195,6 +195,49 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("validation_error", error["error"]["code"])
 
+    def test_replan_flow_over_http(self):
+        self.call("POST", "/maps", MAP, "map-1")
+        self.call("POST", "/missions", MISSION, "mission-1")
+        _, plan = self.call("POST", "/missions/run-1/plan", {}, "plan-1")
+        body = {"observed_tick": 2, "positions": {"a": [2, 0], "b": [4, 2]}}
+        status, replan = self.call("POST", "/missions/run-1/replan", body, "replan-1")
+        self.assertEqual(200, status)
+        self.assertEqual("solved", replan["status"])
+        self.assertEqual(2, replan["replan_from"])
+        paths = {entry["agent_id"]: entry["path"] for entry in replan["agents"]}
+        self.assertEqual([2, 0], paths["a"][0])
+        self.assertEqual([4, 2], paths["b"][0])
+        self.assertEqual(replan["makespan"], max(entry["arrival"] for entry in replan["agents"]))
+        # The stored plan and schedule are untouched by the replan.
+        _, stored = self.call("GET", "/missions/run-1")
+        self.assertEqual(plan, stored["plan"])
+        _, schedule = self.call("GET", "/missions/run-1/schedule")
+        self.assertEqual(plan["makespan"], schedule["makespan"])
+        # A replayed request is byte-identical to the first response.
+        _, first = self.raw("POST", "/missions/run-1/replan", body, "replan-2")
+        _, second = self.raw("POST", "/missions/run-1/replan", body, "replan-2")
+        self.assertEqual(first, second)
+
+    def test_replan_error_status_codes_over_http(self):
+        self.call("POST", "/maps", MAP, "map-1")
+        self.call("POST", "/missions", MISSION, "mission-1")
+        body = {"observed_tick": 2, "positions": {"a": [2, 0], "b": [4, 2]}}
+        status, error = self.call("POST", "/missions/ghost/replan", body, "r1")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", error["error"]["code"])
+        status, error = self.call("POST", "/missions/run-1/replan", body, "r2")
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", error["error"]["code"])
+        self.call("POST", "/missions/run-1/plan", {}, "plan-1")
+        status, error = self.call("POST", "/missions/run-1/replan", {**body, "note": 1}, "r3")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", error["error"]["code"])
+        status, error = self.call(
+            "POST", "/missions/run-1/replan", {"observed_tick": 2, "positions": {"a": [2, 0]}}, "r4"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", error["error"]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()
