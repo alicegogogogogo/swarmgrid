@@ -67,11 +67,15 @@ def _closure_cell_set(closures: Closures, timestep: int) -> frozenset[Point]:
     return frozenset(blocked)
 
 
-def _closure_start_conflict(agent: Agent, closures: Closures) -> Conflict | None:
+def _closure_start_conflict(
+    agent: Agent, closures: Closures, tick_offset: int = 0
+) -> Conflict | None:
     """A closure that already covers the agent's start at t=0 blocks the plan.
 
     The first state of every time-indexed path is the start cell at tick 0, so
     such an agent has no legal first state at all; name the closure directly.
+    `tick_offset` only relabels the diagnostic: a replan searches in relative
+    time but reports the absolute tick the snapshot was taken at.
     """
     covering = [
         closure
@@ -82,12 +86,13 @@ def _closure_start_conflict(agent: Agent, closures: Closures) -> Conflict | None
         return None
     return Conflict(
         "closure",
-        0,
+        tick_offset,
         agent.id,
         None,
         agent.start,
         None,
-        f"agent {agent.id} is blocked on its start {list(agent.start)} at t=0 by a temporary closure",
+        f"agent {agent.id} is blocked on its start {list(agent.start)} at t={tick_offset} "
+        "by a temporary closure",
     )
 
 
@@ -95,12 +100,14 @@ def _closure_block_conflict(
     agent: Agent,
     closures: Closures,
     closure_prune: tuple[int, Point] | None = None,
+    tick_offset: int = 0,
 ) -> Conflict:
     """Name the closure that kept `agent` off its goal.
 
     `closure_prune`, when the search actually saw one, is the earliest tick (then
     smallest cell) a closure pruned; report that concrete block. Otherwise fall
-    back to the closure whose interval starts earliest.
+    back to the closure whose interval starts earliest. `tick_offset` relabels
+    the reported ticks from search-relative to absolute time.
     """
     if closure_prune is not None:
         timestep, cell = closure_prune
@@ -117,13 +124,13 @@ def _closure_block_conflict(
         cell = min(interval.cells)
     return Conflict(
         "closure",
-        timestep,
+        timestep + tick_offset,
         agent.id,
         None,
         cell,
         None,
         f"agent {agent.id} cannot reach goal {list(agent.goal)}: a temporary closure blocks "
-        f"{list(cell)} from t={timestep} to t={end_tick}",
+        f"{list(cell)} from t={timestep + tick_offset} to t={end_tick + tick_offset}",
     )
 
 
@@ -221,6 +228,7 @@ def space_time_astar(
     forbidden_edges: frozenset[tuple[Point, int, Point]] = frozenset(),
     hold: int = 0,
     closures: Closures = (),
+    tick_offset: int = 0,
 ) -> tuple[Path | None, Conflict | None]:
     """Plan `agent` in space and time.
 
@@ -242,11 +250,15 @@ def space_time_astar(
     * `closures` -- task-level temporary closures: on the closed tick interval
       the listed cells may not be moved into, waited on, or held at all.
 
+    The search itself always runs in relative time starting at tick 0;
+    `tick_offset` is added to the timesteps of any reported conflict so a
+    replan from a later snapshot names absolute ticks.
+
     Returns `(path, None)` on success, or `(None, conflict)` naming the blocking
     constraint when the goal cannot be reached under them.
     """
     planned = planned or []
-    start_blocked = _closure_start_conflict(agent, closures)
+    start_blocked = _closure_start_conflict(agent, closures, tick_offset)
     if start_blocked is not None:
         return None, start_blocked
     if distance_to_goal is None:
@@ -255,7 +267,7 @@ def space_time_astar(
     if distance_to_goal[index_of_start] is None:
         return None, Conflict(
             "unreachable_goal",
-            0,
+            tick_offset,
             agent.id,
             None,
             agent.start,
@@ -341,7 +353,9 @@ def space_time_astar(
                 (distance_to_goal[map_record.index(neighbor)] + following, following, counter, neighbor),
             )
 
-    return None, _exhausted(agent, planned, forbidden_cells, forbidden_edges, closures, closure_prune)
+    return None, _exhausted(
+        agent, planned, forbidden_cells, forbidden_edges, closures, closure_prune, tick_offset
+    )
 
 
 def _exhausted(
@@ -351,13 +365,14 @@ def _exhausted(
     forbidden_edges: frozenset[tuple[Point, int, Point]],
     closures: Closures = (),
     closure_prune: tuple[int, Point] | None = None,
+    tick_offset: int = 0,
 ) -> Conflict:
     """Explain an exhausted search; the usual causes are checked in order."""
     for other_id, path in planned:
         if path[-1] == agent.goal:
             return Conflict(
                 "vertex",
-                0,
+                tick_offset,
                 agent.id,
                 other_id,
                 agent.goal,
@@ -369,31 +384,31 @@ def _exhausted(
         timestep, cell = min((step, position) for position, step in forbidden_cells)
         return Conflict(
             "vertex",
-            timestep,
+            timestep + tick_offset,
             agent.id,
             None,
             cell,
             None,
             f"agent {agent.id} cannot reach goal {list(agent.goal)}: {list(cell)} is forbidden "
-            f"at t={timestep}",
+            f"at t={timestep + tick_offset}",
         )
     if forbidden_edges:
         timestep, edge = min((step, (source, target)) for source, step, target in forbidden_edges)
         return Conflict(
             "edge",
-            timestep,
+            timestep + tick_offset,
             agent.id,
             None,
             edge[0],
             edge[1],
             f"agent {agent.id} cannot reach goal {list(agent.goal)}: the edge "
-            f"{list(edge[0])}->{list(edge[1])} is forbidden at t={timestep}",
+            f"{list(edge[0])}->{list(edge[1])} is forbidden at t={timestep + tick_offset}",
         )
     if closures:
-        return _closure_block_conflict(agent, closures, closure_prune)
+        return _closure_block_conflict(agent, closures, closure_prune, tick_offset)
     return Conflict(
         "unreachable_goal",
-        0,
+        tick_offset,
         agent.id,
         None,
         agent.goal,
@@ -423,8 +438,14 @@ def _fill_waits(
 # --------------------------------------------------------------------------- #
 
 
-def detect_conflicts(order: tuple[Agent, ...], paths: list[Path]) -> list[Conflict]:
-    """Every vertex conflict and edge swap in a joint plan, ordered by timestep."""
+def detect_conflicts(
+    order: tuple[Agent, ...], paths: list[Path], tick_offset: int = 0
+) -> list[Conflict]:
+    """Every vertex conflict and edge swap in a joint plan, ordered by timestep.
+
+    `tick_offset` relabels the reported timesteps from path-relative to
+    absolute time; the paths themselves are always indexed from 0.
+    """
     found: list[Conflict] = []
     horizon = max((len(path) for path in paths), default=0)
     for timestep in range(horizon):
@@ -440,12 +461,13 @@ def detect_conflicts(order: tuple[Agent, ...], paths: list[Path]) -> list[Confli
                     found.append(
                         Conflict(
                             "vertex",
-                            timestep,
+                            timestep + tick_offset,
                             order[left].id,
                             order[right].id,
                             first,
                             second,
-                            f"{order[left].id} and {order[right].id} both occupy {list(first)} at t={timestep}",
+                            f"{order[left].id} and {order[right].id} both occupy {list(first)} "
+                            f"at t={timestep + tick_offset}",
                         )
                     )
                     continue
@@ -459,13 +481,13 @@ def detect_conflicts(order: tuple[Agent, ...], paths: list[Path]) -> list[Confli
                     found.append(
                         Conflict(
                             "edge",
-                            timestep,
+                            timestep + tick_offset,
                             order[left].id,
                             order[right].id,
                             first,
                             second,
                             f"{order[left].id} and {order[right].id} swap {list(first)} and "
-                            f"{list(second)} at t={timestep}",
+                            f"{list(second)} at t={timestep + tick_offset}",
                         )
                     )
     return sorted(found, key=lambda conflict: conflict.as_key())
@@ -504,6 +526,7 @@ def plan_mission(
     order_budget: int = DEFAULT_ORDER_BUDGET,
     tree_budget: int = DEFAULT_TREE_BUDGET,
     closures: Closures = (),
+    tick_offset: int = 0,
 ) -> PlanResult:
     """Resolve `mission` with prioritized planning, then a constraint tree.
 
@@ -513,6 +536,11 @@ def plan_mission(
     `closures` are task-level temporary closures shared by every agent: on each
     closure's closed tick interval its cells act as space-time obstacles for the
     whole fleet.
+
+    The search runs in relative time: every path is indexed from tick 0 and the
+    closures are expected in the same frame. `tick_offset` is added to the
+    timesteps of every reported conflict so a replan that shifted its closures
+    into relative time still names absolute ticks in its diagnostics.
     """
     agents = tuple(sorted(mission.agents, key=lambda agent: agent.id))
     orders_budget = _orders_budget(len(agents), order_budget, requested_priority)
@@ -522,7 +550,7 @@ def plan_mission(
     start_blocked = [
         conflict
         for agent in agents
-        if (conflict := _closure_start_conflict(agent, closures)) is not None
+        if (conflict := _closure_start_conflict(agent, closures, tick_offset)) is not None
     ]
     if start_blocked:
         return PlanResult(
@@ -541,7 +569,7 @@ def plan_mission(
     unreachable = [
         Conflict(
             "unreachable_goal",
-            0,
+            tick_offset,
             agent.id,
             None,
             agent.goal,
@@ -573,12 +601,14 @@ def plan_mission(
     for order_ids in sequence:
         tried += 1
         order = tuple(next(agent for agent in agents if agent.id == agent_id) for agent_id in order_ids)
-        paths, failure = _run_order(map_record, order, distance_from_goal, closures=closures)
+        paths, failure = _run_order(
+            map_record, order, distance_from_goal, closures=closures, tick_offset=tick_offset
+        )
         if paths is None:
             if failure is not None:
                 conflicts.append(failure)
             continue
-        joint = detect_conflicts(order, paths)
+        joint = detect_conflicts(order, paths, tick_offset)
         if joint:
             conflicts.extend(joint)
             continue
@@ -594,7 +624,7 @@ def plan_mission(
 
     if requested_priority is None:
         solution = _constraint_tree(
-            map_record, agents, distance_from_goal, tree_budget, budget, closures
+            map_record, agents, distance_from_goal, tree_budget, budget, closures, tick_offset
         )
         if solution is not None:
             paths, tree_conflicts = solution
@@ -628,6 +658,7 @@ def _run_order(
     constraints: ConstraintSet | None = None,
     first_hold: int = 0,
     closures: Closures = (),
+    tick_offset: int = 0,
 ) -> tuple[list[Path] | None, Conflict | None]:
     """Plan `order` one agent at a time, each treating the earlier paths as moving obstacles.
 
@@ -652,13 +683,14 @@ def _run_order(
                 edges,
                 first_hold,
                 closures,
+                tick_offset,
             )
             if path is None:
                 assert failure is not None
                 return None, failure
         else:
             path, failure = _route_with_wait(
-                map_record, agent, planned, distance_from_goal, cells, edges, closures
+                map_record, agent, planned, distance_from_goal, cells, edges, closures, tick_offset
             )
             if path is None:
                 assert failure is not None
@@ -675,6 +707,7 @@ def _route_with_wait(
     cells: frozenset[tuple[Point, int]],
     edges: frozenset[tuple[Point, int, Point]],
     closures: Closures = (),
+    tick_offset: int = 0,
 ) -> tuple[Path | None, Conflict | None]:
     """Try routing `agent` after holding its start cell for 0..N ticks.
 
@@ -685,7 +718,8 @@ def _route_with_wait(
     failure: Conflict | None = None
     for hold in range(DEFAULT_HOLD_BUDGET + 1):
         path, conflict = space_time_astar(
-            map_record, agent, planned, distance_from_goal[agent.goal], cells, edges, hold, closures
+            map_record, agent, planned, distance_from_goal[agent.goal], cells, edges, hold,
+            closures, tick_offset
         )
         if path is not None:
             return path, None
@@ -700,7 +734,7 @@ def _route_with_wait(
         if path[-1] == agent.goal:
             return None, Conflict(
                 "vertex",
-                0,
+                tick_offset,
                 agent.id,
                 other_id,
                 agent.goal,
@@ -712,13 +746,13 @@ def _route_with_wait(
         if path[-1] == agent.start:
             return None, Conflict(
                 "vertex",
-                len(path) - 1,
+                len(path) - 1 + tick_offset,
                 agent.id,
                 other_id,
                 agent.start,
                 agent.goal,
                 f"agent {agent.id} is trapped on {list(agent.start)}: {other_id} finishes "
-                f"there at t={len(path) - 1}",
+                f"there at t={len(path) - 1 + tick_offset}",
             )
     return None, failure
 
@@ -747,6 +781,7 @@ def _constraint_tree(
     tree_budget: int,
     order_budget: int = DEFAULT_ORDER_BUDGET,
     closures: Closures = (),
+    tick_offset: int = 0,
 ) -> tuple[list[Path], list[Conflict]] | None:
     """Best-first search over sets of per-agent space-time constraints.
 
@@ -760,7 +795,9 @@ def _constraint_tree(
     low-level planner.
     """
     root: ConstraintSet = {}
-    paths, failure = _plan_all(map_record, agents, distance_from_goal, root, order_budget, closures)
+    paths, failure = _plan_all(
+        map_record, agents, distance_from_goal, root, order_budget, closures, tick_offset
+    )
     if failure is None:
         return paths, []
     counter = 0
@@ -780,9 +817,9 @@ def _constraint_tree(
         if expanded >= tree_budget:
             return paths, [failure]
         expanded += 1
-        for child in _branch(constraints, failure):
+        for child in _branch(constraints, failure, tick_offset):
             child_paths, child_failure = _plan_all(
-                map_record, agents, distance_from_goal, child, order_budget, closures
+                map_record, agents, distance_from_goal, child, order_budget, closures, tick_offset
             )
             counter += 1
             heapq.heappush(
@@ -806,6 +843,7 @@ def _plan_all(
     constraints: ConstraintSet,
     order_budget: int = DEFAULT_ORDER_BUDGET,
     closures: Closures = (),
+    tick_offset: int = 0,
 ) -> tuple[list[Path], Conflict | None]:
     """Plan all agents at one node of the constraint tree.
 
@@ -821,10 +859,11 @@ def _plan_all(
         order = tuple(next(agent for agent in agents if agent.id == agent_id) for agent_id in order_ids)
         for first_hold in range(DEFAULT_HOLD_BUDGET + 1):
             outcome, failure = _run_order(
-                map_record, order, distance_from_goal, constraints, first_hold, closures
+                map_record, order, distance_from_goal, constraints, first_hold, closures,
+                tick_offset
             )
             if outcome is not None:
-                joint = detect_conflicts(order, outcome)
+                joint = detect_conflicts(order, outcome, tick_offset)
                 if not joint:
                     ordered = {agent.id: path for agent, path in zip(order, outcome)}
                     return [ordered[agent.id] for agent in agents], None
@@ -840,7 +879,7 @@ def _plan_all(
     # A plan that is complete but still conflicts names a concrete vertex or
     # swap, which is far more useful than the dead end of a single agent.
     if report is not None:
-        conflicts = detect_conflicts(agents, report)
+        conflicts = detect_conflicts(agents, report, tick_offset)
         if conflicts:
             return report, conflicts[0]
     return report or [], fallback
@@ -850,14 +889,20 @@ def _paths_cost(paths: list[Path]) -> int:
     return sum(len(path) - 1 for path in paths)
 
 
-def _branch(constraints: ConstraintSet, conflict: Conflict) -> list[ConstraintSet]:
+def _branch(
+    constraints: ConstraintSet, conflict: Conflict, tick_offset: int = 0
+) -> list[ConstraintSet]:
     """Children of a node: forbid the conflicted cell or edge to one of the agents.
 
     A two-agent conflict branches on both agents, so the tree covers "the first
     agent yields" and "the second one does". A conflict that involves a single
     agent is branched on that agent, and a bare `unreachable_goal` cannot be
     branched on at all.
+
+    Conflict timesteps are labeled in absolute time (see `tick_offset`), while
+    constraints are relative to the search frame, so the offset is removed here.
     """
+    timestep = conflict.timestep - tick_offset
     if conflict.other is None:
         if conflict.type in ("unreachable_goal", "closure"):
             # A statically unreachable goal and a temporary closure are facts
@@ -875,15 +920,15 @@ def _branch(constraints: ConstraintSet, conflict: Conflict) -> list[ConstraintSe
         child = {key: (set(cells), set(edges)) for key, (cells, edges) in constraints.items()}
         cells, edges = child.setdefault(agent_id, (set(), set()))
         if single_agent:
-            if conflict.timestep == 0:
+            if timestep == 0:
                 continue
-            edges.add((conflict.position, conflict.timestep - 1, conflict.position))
+            edges.add((conflict.position, timestep - 1, conflict.position))
         elif conflict.type == "vertex":
-            cells.add((conflict.position, conflict.timestep))
+            cells.add((conflict.position, timestep))
         else:
             other_position = conflict.other_position or conflict.position
-            edges.add((conflict.position, conflict.timestep, other_position))
-            edges.add((other_position, conflict.timestep, conflict.position))
+            edges.add((conflict.position, timestep, other_position))
+            edges.add((other_position, timestep, conflict.position))
         children.append(
             {key: (frozenset(value[0]), frozenset(value[1])) for key, value in sorted(child.items())}
         )

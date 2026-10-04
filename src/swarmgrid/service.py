@@ -3,7 +3,17 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Agent, Closure, Map, Mission, identifier, parse_closures
+from .model import (
+    MAX_TICK,
+    Agent,
+    Closure,
+    Map,
+    Mission,
+    identifier,
+    integer,
+    parse_closures,
+    point,
+)
 from .solver import (
     Closures,
     DEFAULT_ORDER_BUDGET,
@@ -182,6 +192,59 @@ class SwarmGrid:
             ],
         }
 
+    def replan(self, mission_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Plan a follow-up from an execution snapshot, leaving the stored plan untouched.
+
+        The snapshot says where every agent actually stands at `observed_tick`;
+        the follow-up plan starts there and runs to the mission's original
+        goals. Nothing about the mission record is read back into the result or
+        overwritten: the stored plan, status, `planned_at`, and schedule stay
+        exactly as the original planning left them.
+        """
+
+        def resolve() -> dict[str, Any]:
+            state, stored_plan = self._load_mission(mission_id)
+            if state["status"] != "solved" or stored_plan is None:
+                raise ConflictError(f"mission {mission_id} has no solved plan to replan from")
+            map_record = self._load_map(state["map_id"])
+            mission = self._rebuild_mission(state)
+            observed_tick, positions, order_budget, tree_budget, closures = self._replan_options(
+                raw, mission, map_record
+            )
+            # The solver works in relative time from tick 0, so the snapshot
+            # becomes the start and every closure shifts back by the observed
+            # tick; `tick_offset` makes the diagnostics absolute again.
+            snapshot = Mission(
+                mission.id,
+                mission.map_id,
+                tuple(
+                    Agent(agent.id, positions[agent.id], agent.goal)
+                    for agent in mission.agents
+                ),
+            )
+            shifted = tuple(
+                Closure(
+                    closure.cells,
+                    closure.start_tick - observed_tick,
+                    closure.end_tick - observed_tick,
+                )
+                for closure in closures
+            )
+            result = plan_mission(
+                map_record,
+                snapshot,
+                None,
+                order_budget,
+                tree_budget,
+                shifted,
+                tick_offset=observed_tick,
+            )
+            plan = self._materialize_replan(snapshot, result, observed_tick)
+            self._assert_replan_invariants(snapshot, plan, closures, observed_tick)
+            return plan
+
+        return self._idempotent(key, f"replan-mission:{mission_id}", resolve)
+
     # ------------------------------------------------------------------ #
     # internals
     # ------------------------------------------------------------------ #
@@ -207,6 +270,14 @@ class SwarmGrid:
                 raise ValidationError("priority must not repeat an agent id")
             if sorted(priority) != known:
                 raise ValidationError("priority must list every agent of the mission exactly once")
+        budget, tree_budget = self._budget_options(raw)
+        closures = parse_closures(raw.get("closures"), map_record)
+        return (
+            list(priority) if priority is not None else None
+        ), budget, tree_budget, closures
+
+    def _budget_options(self, raw: dict[str, Any]) -> tuple[int, int]:
+        """The shared `order_budget`/`tree_budget` validation of plan and replan."""
         budget = raw.get("order_budget", DEFAULT_ORDER_BUDGET)
         if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1 or budget > MAX_ORDER_BUDGET:
             raise ValidationError(f"order_budget must be an integer between 1 and {MAX_ORDER_BUDGET}")
@@ -218,10 +289,47 @@ class SwarmGrid:
             or tree_budget > MAX_TREE_BUDGET
         ):
             raise ValidationError(f"tree_budget must be an integer between 0 and {MAX_TREE_BUDGET}")
+        return budget, tree_budget
+
+    def _replan_options(self, raw: Any, mission: Mission, map_record: Map) -> tuple[
+        int, dict[str, tuple[int, int]], int, int, Closures
+    ]:
+        if not isinstance(raw, dict):
+            raise ValidationError("replan body must be an object")
+        unknown = sorted(
+            set(raw) - {"observed_tick", "positions", "closures", "order_budget", "tree_budget"}
+        )
+        if unknown:
+            raise ValidationError(f"replan body contains unknown fields: {', '.join(unknown)}")
+        for field in ("observed_tick", "positions"):
+            if field not in raw:
+                raise ValidationError(f"replan body is missing required field: {field}")
+        observed_tick = integer(raw["observed_tick"], "observed_tick", 0, MAX_TICK)
+        raw_positions = raw["positions"]
+        if not isinstance(raw_positions, dict):
+            raise ValidationError("positions must be an object keyed by agent id")
+        known = {agent.id for agent in mission.agents}
+        if set(raw_positions) != known:
+            raise ValidationError("positions must list every agent of the mission exactly once")
+        positions = {
+            agent_id: point(value, f"positions[{agent_id}]", map_record.width, map_record.height)
+            for agent_id, value in raw_positions.items()
+        }
+        for agent_id, cell in positions.items():
+            if not map_record.walkable(cell):
+                raise ValidationError(f"positions[{agent_id}] {list(cell)} is an obstacle cell")
+        if len(set(positions.values())) != len(positions):
+            raise ValidationError(
+                "positions must be pairwise distinct: two agents may not occupy one cell"
+            )
+        budget, tree_budget = self._budget_options(raw)
         closures = parse_closures(raw.get("closures"), map_record)
-        return (
-            list(priority) if priority is not None else None
-        ), budget, tree_budget, closures
+        for index, closure in enumerate(closures):
+            if closure.start_tick < observed_tick:
+                raise ValidationError(
+                    f"closures[{index}] must not start before observed_tick {observed_tick}"
+                )
+        return observed_tick, positions, budget, tree_budget, closures
 
     def _rebuild_mission(self, state: dict[str, Any]) -> Mission:
         raw = {
@@ -269,6 +377,79 @@ class SwarmGrid:
             "orders_budget": result.orders_budget,
             "conflicts": [conflict.as_dict() for conflict in result.conflicts],
         }
+
+    def _materialize_replan(
+        self, snapshot: Mission, result: Any, observed_tick: int
+    ) -> dict[str, Any]:
+        """The replan response: the solved shape plus `replan_from`, in absolute time.
+
+        `snapshot` is the synthetic mission whose starts are the observed
+        positions, so each path's first cell is the snapshot position and
+        corresponds to `observed_tick`; arrivals and the makespan shift back to
+        absolute ticks here.
+        """
+        by_id = {agent.id: agent for agent in snapshot.agents}
+        if result.status == "solved":
+            agents = [
+                {
+                    "agent_id": agent_id,
+                    "start": list(by_id[agent_id].start),
+                    "goal": list(by_id[agent_id].goal),
+                    "arrival": observed_tick + len(path) - 1,
+                    "path": [list(cell) for cell in path],
+                }
+                for agent_id, path in zip(result.order, result.paths)
+            ]
+            return {
+                "mission_id": snapshot.id,
+                "map_id": snapshot.map_id,
+                "status": "solved",
+                "method": result.method,
+                "makespan": observed_tick + result.solution_makespan,
+                "replan_from": observed_tick,
+                "priority_order": list(result.order),
+                "orders_tried": result.orders_tried,
+                "orders_budget": result.orders_budget,
+                "agents": sorted(agents, key=lambda entry: entry["agent_id"]),
+            }
+        return {
+            "mission_id": snapshot.id,
+            "map_id": snapshot.map_id,
+            "status": "unsolvable",
+            "method": None,
+            "makespan": None,
+            "replan_from": observed_tick,
+            "priority_order": [],
+            "orders_tried": result.orders_tried,
+            "orders_budget": result.orders_budget,
+            "conflicts": [conflict.as_dict() for conflict in result.conflicts],
+        }
+
+    def _assert_replan_invariants(
+        self,
+        snapshot: Mission,
+        plan: dict[str, Any],
+        closures: Closures,
+        observed_tick: int,
+    ) -> None:
+        """Re-check a replan in its relative frame against the usual invariants."""
+        if plan["status"] != "solved":
+            return
+        relative = dict(plan)
+        relative["makespan"] = plan["makespan"] - observed_tick
+        relative["agents"] = [
+            {**entry, "arrival": entry["arrival"] - observed_tick}
+            for entry in plan["agents"]
+        ]
+        shifted = tuple(
+            Closure(
+                closure.cells,
+                closure.start_tick - observed_tick,
+                closure.end_tick - observed_tick,
+            )
+            for closure in closures
+        )
+        self._assert_plan_invariants(snapshot, relative, shifted)
 
     def _assert_plan_invariants(
         self, mission: Mission, plan: dict[str, Any], closures: Closures = ()

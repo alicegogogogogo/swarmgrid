@@ -678,5 +678,258 @@ class ClosurePlanningTests(unittest.TestCase):
         self.assertEqual(first, again)
 
 
+class ReplanTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = SwarmGrid(str(Path(self.directory.name) / "test.db"))
+        self.service.create_map(
+            {"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "map-lane"
+        )
+        self.service.create_map(
+            {"id": "corridor", "width": 5, "height": 3, "grid": [".....", "..##.", "....."]},
+            "map-corridor",
+        )
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def create(self, agents, mission_id="m1", map_id="lane"):
+        self.service.create_mission(
+            {"id": mission_id, "map_id": map_id, "agents": agents}, f"mission-{mission_id}"
+        )
+
+    def test_replan_follows_from_the_snapshot_positions(self):
+        self.create([{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        self.service.plan("m1", {}, "p1")
+        replan = self.service.replan("m1", {"observed_tick": 3, "positions": {"a": [1, 0]}}, "r1")
+        self.assertEqual("solved", replan["status"])
+        self.assertEqual(3, replan["replan_from"])
+        self.assertEqual(["a"], replan["priority_order"])
+        entry = replan["agents"][0]
+        self.assertEqual([1, 0], entry["start"])
+        self.assertEqual([4, 0], entry["goal"])
+        self.assertEqual([1, 0], entry["path"][0])
+        self.assertEqual([[1, 0], [2, 0], [3, 0], [4, 0]], entry["path"])
+        # arrival and makespan are absolute ticks, not offsets from the snapshot.
+        self.assertEqual(6, entry["arrival"])
+        self.assertEqual(6, replan["makespan"])
+
+    def test_arrived_agent_occupies_only_the_observed_tick(self):
+        self.service.create_map({"id": "row", "width": 3, "height": 1, "grid": ["..."]}, "map-row")
+        self.create(
+            [
+                {"id": "a", "start": [0, 0], "goal": [1, 0]},
+                {"id": "b", "start": [2, 0], "goal": [0, 0]},
+            ],
+            "m1",
+            "row",
+        )
+        self.service.plan("m1", {}, "p1")
+        replan = self.service.replan(
+            "m1", {"observed_tick": 5, "positions": {"a": [1, 0], "b": [2, 0]}}, "r1"
+        )
+        self.assertEqual("solved", replan["status"])
+        paths = {entry["agent_id"]: entry["path"] for entry in replan["agents"]}
+        arrivals = {entry["agent_id"]: entry["arrival"] for entry in replan["agents"]}
+        # a sits on its goal at the observed tick: it arrives then and blocks
+        # nothing afterwards, so b crosses that cell on the very next tick.
+        self.assertEqual([[1, 0]], paths["a"])
+        self.assertEqual(5, arrivals["a"])
+        self.assertEqual([[2, 0], [1, 0], [0, 0]], paths["b"])
+        self.assertEqual(7, arrivals["b"])
+        self.assertEqual(7, replan["makespan"])
+
+    def test_replan_resolves_conflicts_between_moving_agents(self):
+        self.create(
+            [
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+            ],
+            "m1",
+            "corridor",
+        )
+        self.service.plan("m1", {}, "p1")
+        replan = self.service.replan(
+            "m1", {"observed_tick": 1, "positions": {"a": [1, 0], "b": [4, 1]}}, "r1"
+        )
+        self.assertEqual("solved", replan["status"])
+        self.assertEqual(["a", "b"], [entry["agent_id"] for entry in replan["agents"]])
+        paths = {
+            entry["agent_id"]: [tuple(cell) for cell in entry["path"]]
+            for entry in replan["agents"]
+        }
+        self.assertEqual((1, 0), paths["a"][0])
+        self.assertEqual((4, 1), paths["b"][0])
+        self.assertEqual((4, 0), paths["a"][-1])
+        self.assertEqual((0, 0), paths["b"][-1])
+        self.assertEqual(
+            replan["makespan"], max(entry["arrival"] for entry in replan["agents"])
+        )
+        for timestep in range(replan["replan_from"], replan["makespan"] + 1):
+            index = timestep - replan["replan_from"]
+            occupied = [path[index] for path in paths.values() if index < len(path)]
+            self.assertEqual(
+                len(occupied), len(set(occupied)), f"collision at t={timestep}"
+            )
+
+    def test_closure_covering_the_snapshot_position_is_a_closure_diagnostic(self):
+        self.create([{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        self.service.plan("m1", {}, "p1")
+        replan = self.service.replan(
+            "m1",
+            {
+                "observed_tick": 3,
+                "positions": {"a": [1, 0]},
+                "closures": [{"cells": [[1, 0]], "start_tick": 3, "end_tick": 9}],
+            },
+            "r1",
+        )
+        self.assertEqual("unsolvable", replan["status"])
+        self.assertEqual(3, replan["replan_from"])
+        self.assertIsNone(replan["makespan"])
+        self.assertNotIn("agents", replan)
+        conflict = replan["conflicts"][0]
+        self.assertEqual("closure", conflict["type"])
+        self.assertEqual(3, conflict["timestep"])
+        self.assertEqual([1, 0], conflict["position"])
+        self.assertEqual("a", conflict["agent"])
+        self.assertIsNone(conflict["other"])
+
+    def test_replan_unsolvable_conflicts_use_absolute_ticks(self):
+        self.create([{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        self.service.plan("m1", {}, "p1")
+        replan = self.service.replan(
+            "m1",
+            {
+                "observed_tick": 5,
+                "positions": {"a": [0, 0]},
+                "closures": [
+                    {"cells": [[1, 0], [2, 0]], "start_tick": 5, "end_tick": 100000}
+                ],
+            },
+            "r1",
+        )
+        self.assertEqual("unsolvable", replan["status"])
+        self.assertEqual("closure", replan["conflicts"][0]["type"])
+        self.assertEqual(6, replan["conflicts"][0]["timestep"])
+        for conflict in replan["conflicts"]:
+            self.assertGreaterEqual(conflict["timestep"], 5)
+
+    def test_replan_body_is_validated(self):
+        self.create(
+            [
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+            ],
+            "m1",
+            "corridor",
+        )
+        self.service.plan("m1", {}, "p1")
+        positions = {"a": [1, 0], "b": [4, 1]}
+        cases = [
+            ({"positions": positions}, "missing required field: observed_tick"),
+            ({"observed_tick": 1}, "missing required field: positions"),
+            ({"observed_tick": -1, "positions": positions}, "between 0 and 100000"),
+            ({"observed_tick": 100001, "positions": positions}, "between 0 and 100000"),
+            ({"observed_tick": 1.5, "positions": positions}, "must be an integer"),
+            ({"observed_tick": 1, "positions": positions, "priority": ["a", "b"]}, "unknown fields"),
+            ({"observed_tick": 1, "positions": {"a": [1, 0]}}, "exactly once"),
+            (
+                {"observed_tick": 1, "positions": {**positions, "z": [0, 0]}},
+                "exactly once",
+            ),
+            ({"observed_tick": 1, "positions": {"a": [2, 1], "b": [4, 1]}}, "obstacle"),
+            ({"observed_tick": 1, "positions": {"a": [9, 0], "b": [4, 1]}}, "between 0 and 4"),
+            ({"observed_tick": 1, "positions": {"a": [1, 0], "b": [1, 0]}}, "pairwise distinct"),
+            ({"observed_tick": 1, "positions": positions, "order_budget": 0}, "order_budget"),
+            ({"observed_tick": 1, "positions": positions, "tree_budget": 4097}, "tree_budget"),
+            (
+                {
+                    "observed_tick": 5,
+                    "positions": positions,
+                    "closures": [{"cells": [[0, 0]], "start_tick": 4, "end_tick": 9}],
+                },
+                "must not start before observed_tick",
+            ),
+        ]
+        for index, (body, pattern) in enumerate(cases):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(ValidationError, pattern):
+                    self.service.replan("m1", body, f"bad-{index}")
+
+    def test_replan_requires_an_idempotency_key(self):
+        self.create([{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        self.service.plan("m1", {}, "p1")
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.service.replan("m1", {"observed_tick": 1, "positions": {"a": [0, 0]}}, None)
+
+    def test_replan_of_an_unknown_mission_is_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.replan("ghost", {"observed_tick": 1, "positions": {}}, "r1")
+
+    def test_replan_requires_a_solved_plan(self):
+        self.create([{"id": "a", "start": [0, 0], "goal": [4, 0]}])
+        with self.assertRaisesRegex(ConflictError, "no solved plan"):
+            self.service.replan("m1", {"observed_tick": 1, "positions": {"a": [0, 0]}}, "r1")
+        # A mission whose planning came back unsolvable has no solved plan either.
+        self.service.create_map(
+            {"id": "narrow", "width": 4, "height": 1, "grid": ["...."]}, "map-narrow"
+        )
+        self.create(
+            [
+                {"id": "a", "start": [0, 0], "goal": [3, 0]},
+                {"id": "b", "start": [3, 0], "goal": [0, 0]},
+            ],
+            "swap",
+            "narrow",
+        )
+        self.service.plan("swap", {}, "p2")
+        with self.assertRaisesRegex(ConflictError, "no solved plan"):
+            self.service.replan(
+                "swap", {"observed_tick": 1, "positions": {"a": [1, 0], "b": [2, 0]}}, "r2"
+            )
+
+    def test_replan_leaves_the_stored_plan_and_schedule_untouched(self):
+        self.create(
+            [
+                {"id": "a", "start": [0, 0], "goal": [4, 0]},
+                {"id": "b", "start": [4, 0], "goal": [0, 0]},
+            ],
+            "m1",
+            "corridor",
+        )
+        self.service.plan("m1", {}, "p1")
+        before = self.service.get_mission("m1")
+        schedule_before = self.service.schedule("m1")
+        replan = self.service.replan(
+            "m1", {"observed_tick": 2, "positions": {"a": [2, 0], "b": [4, 2]}}, "r1"
+        )
+        self.assertEqual("solved", replan["status"])
+        after = self.service.get_mission("m1")
+        self.assertEqual(before, after)
+        self.assertEqual(before["plan"], after["plan"])
+        self.assertEqual(before["planned_at"], after["planned_at"])
+        self.assertEqual(schedule_before, self.service.schedule("m1"))
+
+    def test_replan_is_idempotent_and_survives_a_restart(self):
+        path = str(Path(self.directory.name) / "restart.db")
+        first = SwarmGrid(path)
+        first.create_map({"id": "lane", "width": 5, "height": 1, "grid": ["....."]}, "map-1")
+        first.create_mission(
+            {"id": "m1", "map_id": "lane", "agents": [{"id": "a", "start": [0, 0], "goal": [4, 0]}]},
+            "m1",
+        )
+        first.plan("m1", {}, "p1")
+        body = {"observed_tick": 2, "positions": {"a": [1, 0]}}
+        replan = first.replan("m1", body, "r1")
+        self.assertEqual(replan, first.replan("m1", body, "r1"))
+        second = SwarmGrid(path)
+        # The recorded response replays after a restart, and recomputing the
+        # same request under a fresh key yields the same plan.
+        self.assertEqual(replan, second.replan("m1", body, "r1"))
+        self.assertEqual(replan, second.replan("m1", body, "r2"))
+        self.assertEqual("solved", second.get_mission("m1")["status"])
+
+
 if __name__ == "__main__":
     unittest.main()

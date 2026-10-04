@@ -56,6 +56,15 @@ class Handler(BaseHTTPRequestHandler):
         if (
             len(parts) == 3
             and parts[0] == "missions"
+            and parts[2] == "replan"
+            and self.command == "POST"
+        ):
+            return 200, self.service.replan(
+                parts[1], self._body(), self.headers.get("Idempotency-Key")
+            )
+        if (
+            len(parts) == 3
+            and parts[0] == "missions"
             and parts[2] == "schedule"
             and self.command == "GET"
         ):

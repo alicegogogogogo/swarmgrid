@@ -30,6 +30,12 @@ echo "--- GET /missions/shift-1 ---"
 curl -s "$BASE/missions/shift-1"; echo
 echo "--- GET /missions/shift-1/schedule ---"
 curl -s "$BASE/missions/shift-1/schedule"; echo
+echo "--- POST /missions/shift-1/replan ---"
+curl -s -X POST "$BASE/missions/shift-1/replan" -H "$JSON" -H 'Idempotency-Key: shift-1-replan-1' \
+  -d '{"observed_tick":2,"positions":{"agv-1":[2,0],"agv-2":[4,2]}}'; echo
+echo "--- POST /missions/shift-1/replan (replayed key) ---"
+curl -s -X POST "$BASE/missions/shift-1/replan" -H "$JSON" -H 'Idempotency-Key: shift-1-replan-1' \
+  -d '{"observed_tick":2,"positions":{"agv-1":[2,0],"agv-2":[4,2]}}'; echo
 echo "--- temporary closure: POST /missions/closed/plan ---"
 curl -s -X POST "$BASE/missions" -H "$JSON" -H 'Idempotency-Key: closed-request' \
   -d '{"id":"closed","map_id":"warehouse","agents":[{"id":"agv-1","start":[0,0],"goal":[4,0]}]}' >/dev/null
